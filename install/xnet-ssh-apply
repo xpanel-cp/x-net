@@ -1,0 +1,341 @@
+#!/usr/bin/env bash
+# ============================================================
+#  xnet-ssh-apply — applies the panel's SSH subsystem settings to the real
+#  system services (Dropbear, stunnel/TLS, SlowDNS, BadVPN/UDPGW, WebSocket,
+#  and per-instance sshd config files) and (re)starts/stops each unit to match.
+#
+#  The panel (running as the unprivileged "xnet" user) writes its settings to
+#  the JSON file and invokes this script via:
+#     sudo -n /opt/xnet/xnet-ssh-apply <settings-json-path>
+#
+#  CRITICAL: This script NEVER modifies AllowGroups in any sshd config file.
+#  Only the Port directive is updated — protocol group isolation is preserved.
+#
+#  Exit codes: 0 = success, 1 = usage/input error, 2 = partial apply error
+# ============================================================
+set -uo pipefail
+
+SETTINGS_FILE="${1:-/opt/xnet/ssh-settings.json}"
+
+log() { echo "[xnet-ssh-apply] $*"; }
+
+[ -f "$SETTINGS_FILE" ] || { log "settings file not found: $SETTINGS_FILE"; exit 1; }
+
+# --- JSON readers ------------------------------------------------------------
+have_jq=0
+command -v jq >/dev/null 2>&1 && have_jq=1
+
+jget() {
+  local path="$1" def="${2:-}"
+  local val=""
+  if [ "$have_jq" = "1" ]; then
+    val="$(jq -r "$path // empty" "$SETTINGS_FILE" 2>/dev/null)"
+  else
+    val="$(python3 - "$SETTINGS_FILE" "$path" <<'PY' 2>/dev/null
+import json,sys
+data=json.load(open(sys.argv[1]))
+path=sys.argv[2].lstrip('.').split('.')
+cur=data
+for k in path:
+    if isinstance(cur,dict) and k in cur:
+        cur=cur[k]
+    else:
+        cur=""
+        break
+print("" if cur is None else cur)
+PY
+)"
+  fi
+  [ -z "$val" ] && val="$def"
+  echo "$val"
+}
+
+HAD_ERROR=0
+
+restart_unit() {
+  local unit="$1"
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl enable "$unit" >/dev/null 2>&1 || true
+  if ! systemctl restart "$unit" >/dev/null 2>&1; then
+    systemctl start "$unit" >/dev/null 2>&1 || { log "warning: failed to start $unit"; HAD_ERROR=1; }
+  fi
+}
+
+stop_unit() {
+  local unit="$1"
+  systemctl stop "$unit" >/dev/null 2>&1 || true
+  systemctl disable "$unit" >/dev/null 2>&1 || true
+  case "$unit" in
+    slowdns)      pkill -f dns-server >/dev/null 2>&1 || true ;;
+    badvpn-udpgw) pkill -f badvpn-udpgw >/dev/null 2>&1 || true ;;
+  esac
+}
+
+# --- Helper: Update Port directive in sshd config (preserves AllowGroups) ----
+update_sshd_port() {
+  local config_file="$1" new_port="$2"
+  [ -f "$config_file" ] || return 0
+  if grep -q "^Port " "$config_file"; then
+    sed -i "s/^Port [0-9]\+/Port $new_port/" "$config_file"
+  else
+    sed -i "1i Port $new_port" "$config_file"
+  fi
+}
+
+# --- OpenSSH (main sshd on port 22) -----------------------------------------
+apply_openssh() {
+  local enabled port maxs
+  enabled="$(jget '.openssh.enabled' 'true')"
+  port="$(jget '.openssh.port' '22')"
+  maxs="$(jget '.openssh.maxSessions' '10')"
+  [ -f /etc/ssh/sshd_config ] || return 0
+
+  if [[ "$port" =~ ^[0-9]+$ ]]; then
+    update_sshd_port /etc/ssh/sshd_config "$port"
+  fi
+  if [[ "$maxs" =~ ^[0-9]+$ ]] && [ "$maxs" -gt 0 ]; then
+    if grep -qiE '^[#[:space:]]*MaxSessions[[:space:]]' /etc/ssh/sshd_config; then
+      sed -i -E "s/^[#[:space:]]*MaxSessions[[:space:]].*/MaxSessions ${maxs}/I" /etc/ssh/sshd_config
+    else
+      echo "MaxSessions ${maxs}" >> /etc/ssh/sshd_config
+    fi
+  fi
+  grep -qiE '^[[:space:]]*AllowTcpForwarding[[:space:]]+yes' /etc/ssh/sshd_config || echo "AllowTcpForwarding yes" >> /etc/ssh/sshd_config
+
+  local unit="ssh"
+  systemctl list-unit-files ssh.service 2>/dev/null | grep -q ssh.service || unit="sshd"
+  if [ "$enabled" = "true" ]; then restart_unit "$unit"; fi
+  log "OpenSSH: port=${port} maxSessions=${maxs}"
+}
+
+# --- WebSocket sshd (sshd_config_ws) -----------------------------------------
+apply_ws_sshd() {
+  local enabled port
+  enabled="$(jget '.websocket.enabled' 'false')"
+  port="$(jget '.websocket.port' '2222')"
+  [[ "$port" =~ ^[0-9]+$ ]] || port=2222
+
+  if [ -f /etc/ssh/sshd_config_ws ]; then
+    update_sshd_port /etc/ssh/sshd_config_ws "$port"
+  fi
+
+  if [ "$enabled" = "true" ]; then
+    restart_unit xnet-ws 2>/dev/null || restart_unit sshd-ws 2>/dev/null || true
+  else
+    stop_unit xnet-ws 2>/dev/null || true
+    stop_unit sshd-ws 2>/dev/null || true
+  fi
+
+  # Open firewall for the WS listener port (panel-managed WebSocket proxy)
+  local ws_listen_port
+  ws_listen_port="$(jget '.websocket.listenPort' '8880')"
+  if [ "$enabled" = "true" ] && [[ "$ws_listen_port" =~ ^[0-9]+$ ]]; then
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+      ufw allow "${ws_listen_port}/tcp" >/dev/null 2>&1 || true
+    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+      firewall-cmd --permanent --add-port="${ws_listen_port}/tcp" >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+  fi
+  log "WebSocket sshd: port=${port} enabled=${enabled}"
+}
+
+# --- TLS sshd (sshd_config_tls) + stunnel ------------------------------------
+apply_tls() {
+  local enabled port cert key
+  enabled="$(jget '.tlsSsl.enabled' 'false')"
+  port="$(jget '.tlsSsl.port' '2083')"
+  cert="$(jget '.tlsSsl.certPath' '')"
+  key="$(jget '.tlsSsl.keyPath' '')"
+  local ws_tls_port
+  ws_tls_port="$(jget '.tlsSsl.wsTlsPort' '2084')"
+
+  # sshd_tls internal port (stunnel connects to this for direct SSH-TLS)
+  local sshd_tls_port="2223"
+  [[ "$port" =~ ^[0-9]+$ ]] || port=2083
+  [[ "$ws_tls_port" =~ ^[0-9]+$ ]] || ws_tls_port=2084
+
+  if [ -f /etc/ssh/sshd_config_tls ]; then
+    update_sshd_port /etc/ssh/sshd_config_tls "$sshd_tls_port"
+  fi
+
+  if [ "$enabled" != "true" ]; then
+    stop_unit stunnel4
+    stop_unit sshd-tls 2>/dev/null || true
+    log "TLS/stunnel: disabled"
+    return 0
+  fi
+
+  # Restart sshd-tls
+  restart_unit sshd-tls 2>/dev/null || true
+
+  # Configure stunnel with two sections:
+  # 1. ssh-tls-direct: accepts on TLS port, forwards raw SSH to sshd_tls
+  # 2. ssh-tls-payload: accepts on WS-TLS port, forwards HTTP payload to WSProxy
+  mkdir -p /etc/stunnel
+  if [ -z "$cert" ] || [ -z "$key" ] || [ ! -f "$cert" ] || [ ! -f "$key" ]; then
+    cert=/etc/stunnel/xnet-self.crt
+    key=/etc/stunnel/xnet-self.key
+    if [ ! -f "$cert" ] || [ ! -f "$key" ]; then
+      openssl req -x509 -newkey rsa:2048 -keyout "$key" -out "$cert" -days 3650 -nodes \
+        -subj "/CN=xnet" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # Determine WSProxy port (where HTTP-payload TLS traffic goes)
+  local ws_proxy_port
+  ws_proxy_port="$(jget '.websocket.port' '80')"
+
+  cat > /etc/stunnel/stunnel.conf <<CONF
+pid = /var/run/stunnel4.pid
+
+[ssh-tls-direct]
+accept = ${port}
+connect = 127.0.0.1:${sshd_tls_port}
+cert = ${cert}
+key = ${key}
+
+[ssh-tls-payload]
+accept = ${ws_tls_port}
+connect = 127.0.0.1:${ws_proxy_port}
+cert = ${cert}
+key = ${key}
+CONF
+  [ -f /etc/default/stunnel4 ] && sed -i 's/^ENABLED=.*/ENABLED=1/' /etc/default/stunnel4 2>/dev/null || true
+  restart_unit stunnel4
+  log "TLS/stunnel: direct_port=${port}->sshd_tls:${sshd_tls_port}, ws_tls_port=${ws_tls_port}->ws_proxy:${ws_proxy_port}"
+}
+
+# --- SlowDNS sshd (sshd_config_dns) + slowdns service ------------------------
+apply_slowdns() {
+  local enabled port ns key bin
+  enabled="$(jget '.slowdns.enabled' 'false')"
+  port="$(jget '.slowdns.port' '2224')"
+  ns="$(jget '.slowdns.nsDomain' '')"
+  key="$(jget '.slowdns.privateKey' '')"
+  local dns_port
+  dns_port="$(jget '.slowdns.dnsPort' '5300')"
+
+  # Update sshd_config_dns Port
+  [[ "$port" =~ ^[0-9]+$ ]] || port=2224
+  if [ -f /etc/ssh/sshd_config_dns ]; then
+    update_sshd_port /etc/ssh/sshd_config_dns "$port"
+  fi
+
+  if [ "$enabled" != "true" ]; then
+    stop_unit slowdns
+    stop_unit sshd-dns 2>/dev/null || true
+    log "SlowDNS: disabled"
+    return 0
+  fi
+
+  # Restart sshd-dns
+  restart_unit sshd-dns 2>/dev/null || true
+
+  bin="$(command -v dns-server || command -v sldns-server || echo /usr/local/bin/dns-server)"
+  if [ ! -x "$bin" ]; then
+    if [ "$(uname -m)" = "x86_64" ]; then
+      log "SlowDNS: fetching prebuilt server binary..."
+      curl -fsSL "https://raw.githubusercontent.com/khaledagn/DNS-AGN/main/files/dns-server" -o /usr/local/bin/dns-server 2>/dev/null \
+        && chmod +x /usr/local/bin/dns-server && bin=/usr/local/bin/dns-server
+    fi
+  fi
+  if [ ! -x "$bin" ] || [ -z "$ns" ]; then
+    log "SlowDNS: server binary or nsDomain missing — service not started"
+    return 0
+  fi
+  mkdir -p /etc/slowdns
+  [ -n "$key" ] && printf '%s' "$key" > /etc/slowdns/server.key
+  cat > /etc/systemd/system/slowdns.service <<UNIT
+[Unit]
+Description=SlowDNS server (xnet-managed)
+After=network.target
+[Service]
+ExecStart=${bin} -udp :${dns_port} -privkey-file /etc/slowdns/server.key ${ns} 127.0.0.1:${port}
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+UNIT
+  pkill -f dns-server >/dev/null 2>&1 || true
+  sleep 0.3
+  restart_unit slowdns
+  log "SlowDNS: dns_port=${dns_port} sshd_port=${port} ns=${ns}"
+}
+
+# --- Dropbear ----------------------------------------------------------------
+apply_dropbear() {
+  local enabled port
+  enabled="$(jget '.dropbear.enabled' 'false')"
+  port="$(jget '.dropbear.port' '444')"
+  if [ "$enabled" != "true" ]; then stop_unit dropbear; log "Dropbear: disabled"; return 0; fi
+  [[ "$port" =~ ^[0-9]+$ ]] || port=444
+
+  if [ -d /etc/default ]; then
+    {
+      echo "NO_START=0"
+      echo "DROPBEAR_PORT=${port}"
+      echo "DROPBEAR_EXTRA_ARGS="
+    } > /etc/default/dropbear
+  fi
+
+  if systemctl list-unit-files dropbear.service 2>/dev/null | grep -q dropbear.service; then
+    restart_unit dropbear
+  else
+    local bin; bin="$(command -v dropbear || echo /usr/sbin/dropbear)"
+    cat > /etc/systemd/system/dropbear.service <<UNIT
+[Unit]
+Description=Dropbear SSH server (xnet-managed)
+After=network.target
+[Service]
+ExecStart=${bin} -F -E -p ${port}
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+UNIT
+    restart_unit dropbear
+  fi
+  log "Dropbear: port=${port}"
+}
+
+# --- BadVPN UDPGW ------------------------------------------------------------
+apply_udpgw() {
+  local enabled port bin
+  enabled="$(jget '.udpgw.enabled' 'false')"
+  port="$(jget '.udpgw.port' '7300')"
+  if [ "$enabled" != "true" ]; then stop_unit badvpn-udpgw; log "UDPGW: disabled"; return 0; fi
+  [[ "$port" =~ ^[0-9]+$ ]] || port=7300
+  bin="$(command -v badvpn-udpgw || echo /usr/bin/badvpn-udpgw)"
+  [ -x "$bin" ] || { log "UDPGW: badvpn-udpgw binary not found — skipping"; return 0; }
+  cat > /etc/systemd/system/badvpn-udpgw.service <<UNIT
+[Unit]
+Description=BadVPN UDPGW for SSH UDP forwarding (xnet-managed)
+After=network.target
+[Service]
+ExecStart=${bin} --listen-addr 127.0.0.1:${port} --max-clients 512 --max-connections-for-client 10
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target
+UNIT
+  pkill -f badvpn-udpgw >/dev/null 2>&1 || true
+  sleep 0.3
+  restart_unit badvpn-udpgw
+  log "UDPGW: port=${port}"
+}
+
+# --- Main --------------------------------------------------------------------
+main() {
+  apply_openssh
+  apply_ws_sshd
+  apply_tls
+  apply_slowdns
+  apply_dropbear
+  apply_udpgw
+  log "apply complete"
+}
+
+main
+
+if [ "$HAD_ERROR" -ne 0 ]; then
+  exit 2
+fi
+exit 0
