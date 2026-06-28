@@ -1,129 +1,113 @@
 <div align="center">
-
 # X-NET Panel
-
-**پنل مدیریت VPN / Proxy و تونل SSH — با هستهٔ Sing-box و معماری چندنودی**
-
+**VPN / Proxy and SSH Tunneling Management Panel — Powered by Sing-box Core and Multi-Node Architecture**
 [![Sing-box](https://img.shields.io/badge/engine-sing--box-10b981)](https://sing-box.sagernet.org)
 [![Backend](https://img.shields.io/badge/backend-Go-00ADD8)](https://go.dev)
 [![Frontend](https://img.shields.io/badge/frontend-React%20%2B%20Vite-61dafb)](https://react.dev)
 [![License](https://img.shields.io/badge/license-X--NET-yellow)](../LICENSE)
-
 </div>
 
----
-
-<div dir="rtl">
-
-## معرفی
-
-پروزه **X-NET** پنلی برای ساخت و مدیریت سرویس‌های **VPN/Proxy** و **اکانت‌های SSH** است؛ از طریق آن کاربران (اشتراک‌ها) را می‌سازید، ترافیک و انقضای هرکدام را کنترل می‌کنید و لینک اشتراک تحویل می‌دهید.
-
-- پردازش ترافیک با هستهٔ **Sing-box**
-- امکان ساخت **اکانت SSH** با پروتکل‌های متنوع: SSH-over-WebSocket، Stunnel/TLS، SlowDNS، Dropbear و BadVPN/UDPGW
-- **ایزوله‌سازی دسترسی:** هر اکانت SSH فقط به پورت/پروتکل خودش دسترسی دارد
-- مدیریت **چند سرور** از یک رابط واحد: یک سرور «پنل» و بقیه «نود»
+## Language Versions
+[English](README.md) | [فارسی](README.fa.md) | [Русский](README.ru.md) | [中文](README.zh.md)
 
 ---
+## Introduction
+The **X-NET** project is a panel for creating and managing **VPN/Proxy** services and **SSH accounts**. Through it, you can create users (subscriptions), control their traffic and expiration, and deliver subscription links.
 
-## نصب
+- Traffic processing with **Sing-box** core
+- Ability to create **SSH accounts** with various protocols: SSH-over-WebSocket, Stunnel/TLS, SlowDNS, Dropbear, and BadVPN/UDPGW
+- **Access Isolation:** Each SSH account has access only to its own port/protocol
+- Manage **multiple servers** from a single interface: one "panel" server and the rest "nodes"
 
-### پیش‌نیازها
+## Installation
+### Prerequisites
+- Linux server (Ubuntu / Debian recommended), `amd64` architecture
+- `root` access
 
-- سرور لینوکس (Ubuntu / Debian توصیه می‌شود)، معماری `amd64`
-- دسترسی `root`
-
-### نصب پنل
-
+### Panel Installation
 ```bash
 apt update
 bash <(curl -fsSL https://raw.githubusercontent.com/xpanel-cp/x-net/main/install/xnet.sh)
 ```
 
-نصب‌کننده ۳ نسخهٔ آخر را در یک منو نشان می‌دهد؛ برای نصب مستقیم یک نسخهٔ مشخص:
-
+The installer shows the last 3 versions in a menu; for direct installation of a specific version:
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/xpanel-cp/x-net/main/install/xnet.sh) v1.2.3
 ```
 
-در نصب اولیه، پورت پنل و اطلاعات ادمین پرسیده می‌شود، سرویس systemd ساخته می‌شود، هستهٔ sing-box و زیرسیستم‌های SSH نصب می‌شوند و پورت در فایروال باز می‌شود. در اجرای مجدد (بروزرسانی)، فایل `.env` و دیتابیس حفظ می‌شوند.
+During initial installation, the panel port and admin credentials are requested, a systemd service is created, sing-box core and SSH subsystems are installed, and the port is opened in the firewall. On subsequent runs (updates), the `.env` file and database are preserved.
 
-### نصب نود (Agent)
-
-همان دستور نصب را روی سرور نود اجرا کنید و در پرسش نقش، مقدار `agent` را انتخاب کنید. سپس در پنل وارد **سرورها و نودها → Register Node** شوید؛ کلیدهای تولیدشده را در `/opt/xnet/.env` نود قرار دهید و سرویس را restart کنید:
-
+### Node (Agent) Installation
+Run the same installation command on the node server and select `agent` for the role. Then, in the panel, go to **Servers and Nodes → Register Node**; place the generated keys in the node's `/opt/xnet/.env` and restart the service:
 ```bash
 nano /opt/xnet/.env
-#   NODE_ROLE=agent
-#   NODE_API_KEY=xnetnode_...
-#   NODE_SECRET_KEY=...
+# NODE_ROLE=agent
+# NODE_API_KEY=xnetnode_...
+# NODE_SECRET_KEY=...
 systemctl restart xnet
 ```
 
-### مدیریت سرویس
-
+### Service Management
 ```bash
-systemctl status xnet      # وضعیت سرویس
-journalctl -u xnet -f      # لاگ زنده
-systemctl restart xnet     # اجرای دوباره
+systemctl status xnet # Service status
+journalctl -u xnet -f # Live logs
+systemctl restart xnet # Restart
 ```
 
-> **امنیت:** آدرس `http://IP:PORT` رمزنگاری‌شده نیست؛ برای محیط واقعی پنل را پشت دامنه + HTTPS قرار دهید.
+> **Security:** The address `http://IP:PORT` is not encrypted; for production, place the panel behind a domain + HTTPS.
 
----
-
-## پروتکل‌ها
-
-### پروتکل‌های هسته (Sing-box)
-
+## Protocols
+### Core Protocols (Sing-box)
 `VLESS` · `VMess` · `Trojan` · `Shadowsocks` · `SOCKS` · `HTTP` · `TUIC` · `Hysteria2` · `WireGuard` · `Mixed` · `TUN` · `ShadowTLS` · `NaiveProxy`
 
-### ترابری‌ها (Transports)
-
+### Transports
 `TCP` · `WebSocket` · `gRPC` · `HTTP/2` · `HTTPUpgrade` · `QUIC`
 
-### امنیت / TLS
-
+### Security / TLS
 `Plain` · `TLS` · `Reality`
 
 ### SSH
-
 `SSH-over-WebSocket` · `Stunnel/TLS` · `SlowDNS` · `Dropbear` · `BadVPN/UDPGW`
 
-## امکانات
+## Features
+### Inbound Management
+Create, edit, clone, enable/disable, and deploy on multiple nodes
 
-### مدیریت اینباندها
-ساخت، ویرایش، کلون، فعال/غیرفعال‌سازی و استقرار روی چند نود
-### مدیریت اشتراک‌ها
-لینک اشتراک، QR Code، سقف حجم، تاریخ انقضا، سقف دستگاه همزمان، تمدید و ریست ترافیک
-### اکانت‌های SSH
-ساخت کاربر سیستمی، محدودسازی ترافیک و تعداد ورود همزمان
-### چندنودی
-نقش‌های panel/agent، همگام‌سازی خودکار، و **تک‌نود فعال (Follow-Me)** با جابجایی نود از لینک اشتراک
-### امنیت
-ورود با JWT، احراز هویت دومرحله‌ای (TOTP)، نقش‌های دسترسی (ادمین/اپراتور/نماینده) و امضای HMAC بین پنل و نود
-### دامنه و گواهی
-بررسی واقعی DNS، صدور/تمدید گواهی TLS (Let's Encrypt)
-### مسیریابی و شبکه
-قوانین Routing (GeoSite/GeoIP، AdBlock)، پیکربندی DNS و کنترل تراکم TCP BBR
-### مانیتورینگ
-داشبورد، تحلیل ترافیک، لاگ زنده، پشتیبان‌گیری/بازیابی دیتابیس
+### Subscription Management
+Subscription links, QR Code, volume cap, expiration date, concurrent device limit, renewal, and traffic reset
+
+### SSH Accounts
+Create system users, limit traffic and concurrent logins
+
+### Multi-Node
+Panel/agent roles, automatic synchronization, and **Single Active Node (Follow-Me)** with node switching via subscription link
+
+### Security
+JWT login, Two-Factor Authentication (TOTP), access roles (admin/operator/representative), and HMAC signing between panel and nodes
+
+### Domain and Certificates
+Real DNS checks, TLS certificate issuance/renewal (Let's Encrypt)
+
+### Routing and Network
+Routing rules (GeoSite/GeoIP, AdBlock), DNS configuration, and TCP BBR congestion control
+
+### Monitoring
+Dashboard, traffic analytics, live logs, database backup/restore
+
 ### API
-توکن Bearer، مستندات و playground، و فایروال whitelist آی‌پی
-### رابط کاربری
-چندزبانه (فارسی/انگلیسی/روسی/چینی)، تم روشن و تاریک، بروزرسانی خودکار صفحات
+Bearer token, documentation and playground, IP whitelist firewall
 
-## مجوز
+### User Interface
+Multilingual (Persian/English/Russian/Chinese), light and dark themes, automatic page updates
 
-این پروژه تحت **X-NET Software License (Version 1.0)** — یک مجوز اختصاصی — منتشر شده است. متن کامل در فایل [`LICENSE`](../LICENSE).
+## License
+This project is released under the **X-NET Software License (Version 1.0)** — a custom license. Full text in the [`LICENSE`](../LICENSE) file.
 
-| وضعیت | توضیح |
+| Status | Description |
 |---|---|
-| ✅ مجاز | استفاده از توزیع رسمی کامپایل‌شده برای مقاصد شخصی و تجاری، نصب روی هر تعداد سرور |
-| 🔒 اختصاصی | سورس‌کد — بدون حق دسترسی، تغییر، انتشار یا مهندسی معکوس |
-| ❌ ممنوع | حذف/تغییر کپی‌رایت، توزیع نسخهٔ تغییریافته، استفاده از نام X-NET بدون اجازهٔ کتبی |
-| ⚠️ بدون ضمانت | نرم‌افزار «همان‌گونه که هست» ارائه می‌شود؛ مسئولیت رعایت قوانین بر عهدهٔ کاربر است |
+| ✅ Allowed | Use of official compiled distribution for personal and commercial purposes, installation on any number of servers |
+| 🔒 Proprietary | Source code — no right to access, modify, distribute, or reverse engineer |
+| ❌ Prohibited | Remove/change copyright, distribute modified versions, use X-NET name without written permission |
+| ⚠️ No Warranty | Software provided "as is"; user is responsible for legal compliance |
 
 > **Copyright (c) 2026 X-NET. All Rights Reserved.**
-
-</div>
