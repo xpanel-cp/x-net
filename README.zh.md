@@ -76,7 +76,7 @@ systemctl restart xnet     # 重启服务
 
 ### 核心协议（Sing-box）
 
-`VLESS` · `VMess` · `Trojan` · `Shadowsocks` · `SOCKS` · `HTTP` · `TUIC` · `Hysteria2` · `WireGuard` · `Mixed` · `TUN` · `ShadowTLS` · `NaiveProxy`
+`VLESS` · `VMess` · `Trojan` · `Shadowsocks` · `SOCKS` · `HTTP` · `TUIC` · `Hysteria2`
 
 ### 传输层
 
