@@ -78,7 +78,7 @@ systemctl restart xnet     # اجرای دوباره
 
 ### پروتکل‌های هسته (Sing-box)
 
-`VLESS` · `VMess` · `Trojan` · `Shadowsocks` · `SOCKS` · `HTTP` · `TUIC` · `Hysteria2` · `WireGuard` · `Mixed` · `TUN` · `ShadowTLS` · `NaiveProxy`
+`VLESS` · `VMess` · `Trojan` · `Shadowsocks` · `SOCKS` · `HTTP` · `TUIC` · `Hysteria2`
 
 ### ترابری‌ها (Transports)
 
