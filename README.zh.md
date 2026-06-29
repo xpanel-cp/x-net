@@ -17,7 +17,7 @@
 
 ## 简介
 
-**X-NET** 是一个用于创建和管理 **VPN/代理** 服务及 **SSH 账户** 的面板。通过它您可以创建用户（订阅），控制每位用户的流量和到期时间，并分发订阅链接。
+**X-NET** 是一个用于创建和管理 **VPN/代理** 服务及 **SSH 账户** 的面板。通过它您可以创建用户（订阅），控制每位用户的流量和到期时间，并提供订阅链接。
 
 - 使用 **Sing-box** 核心处理流量
 - 支持通过多种协议创建 **SSH 账户**：SSH-over-WebSocket、Stunnel/TLS、SlowDNS、Dropbear 和 BadVPN/UDPGW
@@ -50,7 +50,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xpanel-cp/x-net/main/install
 
 ### 安装节点（Agent）
 
-在节点服务器上运行相同的安装命令，在询问角色时选择 `agent`。然后在面板中进入**服务器与节点 → 注册节点**；将生成的密钥填入节点的 `/opt/xnet/.env` 文件并重启服务：
+在节点服务器上运行相同的安装命令，在询问角色时选择 `agent` 选项。然后在面板中进入**服务器与节点 → 注册节点**；将生成的密钥填入节点的 `/opt/xnet/.env` 文件并重启服务：
 
 ```bash
 nano /opt/xnet/.env
@@ -90,8 +90,6 @@ systemctl restart xnet     # 重启服务
 
 `SSH-over-WebSocket` · `Stunnel/TLS` · `SlowDNS` · `Dropbear` · `BadVPN/UDPGW`
 
----
-
 ## 功能特性
 
 ### 入站管理
@@ -104,7 +102,7 @@ systemctl restart xnet     # 重启服务
 创建系统用户，限制流量及同时登录数量
 
 ### 多节点
-panel/agent 角色、自动同步，以及**单一活跃节点（Follow-Me）**功能，支持从订阅链接切换节点
+panel/agent 角色、自动同步，以及**单一活跃节点（Follow-Me）**功能，支持通过订阅链接切换节点
 
 ### 安全性
 JWT 登录、双因素认证（TOTP）、访问角色（管理员/操作员/代理商），以及面板与节点之间的 HMAC 签名验证
@@ -123,8 +121,6 @@ Bearer 令牌、API 文档与测试平台，以及 IP 白名单防火墙
 
 ### 用户界面
 多语言支持（波斯语/英语/俄语/中文）、明暗主题切换、页面自动更新
-
----
 
 ## 许可证
 
