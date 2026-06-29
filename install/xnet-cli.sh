@@ -250,6 +250,156 @@ do_restart() {
   esac
 }
 
+# ---- 6) uninstall -----------------------------------------------------------
+# do_uninstall completely removes X-NET and everything it installed/configured:
+# the panel + CLI, sing-box, all managed SSH subsystems (Dropbear/Stunnel/UDPGW/
+# SlowDNS), the per-protocol sshd instances, the panel-created Linux SSH users
+# and their protocol groups, the service user, sudoers, the nftables accounting
+# table, and the firewall rule for the panel port. It is intentionally careful
+# NOT to damage the server: the main OpenSSH daemon (port 22) is preserved (only
+# the X-Net AllowGroups restriction is reverted), real/login/system accounts are
+# never deleted, and base packages (certbot, nftables, etc.) are left installed.
+do_uninstall() {
+  need_root
+
+  echo
+  echo -e "${C_RED}${C_BOLD}╔═════════════════════════════════════════════════════════╗${C_RESET}"
+  echo -e "${C_RED}${C_BOLD}║  X-NET — COMPLETE UNINSTALL (DESTRUCTIVE, IRREVERSIBLE)  ║${C_RESET}"
+  echo -e "${C_RED}${C_BOLD}╚═════════════════════════════════════════════════════════╝${C_RESET}"
+  echo "  This will permanently remove:"
+  echo "   • The panel, its database and config (${INSTALL_DIR}), and the 'xnet' CLI"
+  echo "   • sing-box + its config (/etc/sing-box, /var/lib/sing-box)"
+  echo "   • Managed SSH subsystems (Dropbear, Stunnel/TLS, BadVPN/UDPGW, SlowDNS)"
+  echo "   • Per-protocol sshd instances (WS/TLS/SlowDNS) and their configs"
+  echo "   • ALL SSH users created by the panel + their protocol groups"
+  echo "   • The 'xnet' service user, sudoers rules, and the nftables accounting table"
+  echo "   • The firewall rule for the panel port"
+  echo
+  echo -e "  ${C_GRN}Preserved:${C_RESET} the main OpenSSH (port 22), your login/system accounts, and base packages."
+  echo
+
+  local ans
+  read -r -p "  Are you sure you want to continue? (y/N): " ans
+  ans="${ans:-n}"
+  case "$ans" in
+    y|Y|yes|YES) ;;
+    *) warn "Uninstall cancelled."; return 0 ;;
+  esac
+
+  # Capture the panel port before we delete .env so we can close the firewall.
+  local panel_port=""
+  panel_port="$(env_get PORT)"; panel_port="${panel_port:-}"
+
+  info "Stopping and removing X-Net services…"
+  local svc
+  for svc in xnet sing-box dropbear badvpn-udpgw slowdns sshd-ws sshd-tls sshd-dns; do
+    systemctl stop "$svc"    >/dev/null 2>&1 || true
+    systemctl disable "$svc" >/dev/null 2>&1 || true
+    rm -f "/etc/systemd/system/${svc}.service" 2>/dev/null || true
+  done
+  # Stunnel is a distro package the panel only enabled+configured: stop/disable
+  # it and drop our config, but leave the package installed.
+  systemctl stop stunnel4    >/dev/null 2>&1 || true
+  systemctl disable stunnel4 >/dev/null 2>&1 || true
+  rm -f /etc/stunnel/xnet-ssh.conf 2>/dev/null || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  ok "Services stopped and unit files removed."
+
+  # Revert the main-sshd hardening: remove ONLY the AllowGroups line the panel
+  # added, validate, then restart sshd so port 22 returns to its prior policy.
+  if [ -f /etc/ssh/sshd_config ]; then
+    sed -i '/^[[:space:]]*AllowGroups[[:space:]][[:space:]]*ssh-tcp-users[[:space:]]*$/d' /etc/ssh/sshd_config
+    if sshd -t >/dev/null 2>&1; then
+      systemctl restart sshd >/dev/null 2>&1 || systemctl restart ssh >/dev/null 2>&1 || true
+      ok "Main sshd AllowGroups restriction reverted (port 22 restored)."
+    else
+      warn "sshd config check failed after edit — verify /etc/ssh/sshd_config manually."
+    fi
+  fi
+  # Remove the dropbear PAM line the panel injected (if present).
+  [ -f /etc/pam.d/dropbear ] && sed -i '/ssh-dropbear-users/d' /etc/pam.d/dropbear 2>/dev/null || true
+
+  # Remove the panel-created SSH users. They are identified ONLY by membership in
+  # the X-Net protocol groups, so real accounts are never touched. We additionally
+  # protect root, the invoking sudo user, every currently logged-in user, the
+  # 'xnet' service user, and any system account (UID < 1000).
+  info "Removing panel-created SSH users…"
+  local keep u uid victims=""
+  keep="root ${SUDO_USER:-} xnet"
+  for u in $(who 2>/dev/null | awk '{print $1}' | sort -u); do keep="$keep $u"; done
+  is_protected() {
+    local x="$1"
+    case " $keep " in *" $x "*) return 0 ;; esac
+    uid="$(id -u "$x" 2>/dev/null || echo 0)"
+    [ "${uid:-0}" -lt 1000 ] && return 0
+    return 1
+  }
+  local grp
+  for grp in ssh-tcp-users ssh-ws-users ssh-tls-users ssh-slowdns-users ssh-dropbear-users; do
+    for u in $(getent group "$grp" 2>/dev/null | awk -F: '{print $4}' | tr ',' ' '); do
+      [ -n "$u" ] || continue
+      is_protected "$u" && continue
+      victims="${victims}${u}
+"
+    done
+  done
+  victims="$(printf '%s' "$victims" | sed '/^$/d' | sort -u)"
+  local removed=0
+  if [ -n "$victims" ]; then
+    while IFS= read -r u; do
+      [ -n "$u" ] || continue
+      userdel -r "$u" >/dev/null 2>&1 || userdel "$u" >/dev/null 2>&1 || true
+      removed=$((removed + 1))
+    done <<EOF
+$victims
+EOF
+  fi
+  ok "Removed ${removed} panel SSH user(s)."
+
+  # Remove the protocol groups and the service user.
+  for grp in ssh-tcp-users ssh-ws-users ssh-tls-users ssh-slowdns-users ssh-dropbear-users; do
+    groupdel "$grp" >/dev/null 2>&1 || true
+  done
+  userdel -r xnet >/dev/null 2>&1 || userdel xnet >/dev/null 2>&1 || true
+
+  # Remove files, directories, binaries and symlinks the panel installed.
+  info "Removing files and directories…"
+  rm -rf "${INSTALL_DIR}" 2>/dev/null || true
+  rm -f  /usr/local/bin/xnet /usr/local/bin/xnet-ssh-apply \
+         /usr/local/bin/sing-box /usr/local/bin/badvpn-udpgw /usr/local/bin/dns-server 2>/dev/null || true
+  rm -rf /etc/sing-box /var/lib/sing-box 2>/dev/null || true
+  rm -rf /etc/xnet /etc/ssl/xnet 2>/dev/null || true
+  rm -f  /etc/ssh/sshd_config_ws /etc/ssh/sshd_config_tls /etc/ssh/sshd_config_dns 2>/dev/null || true
+  rm -f  /etc/dropbear/dropbear_rsa_host_key /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null || true
+  rm -f  /etc/sudoers.d/xnet /etc/sudoers.d/xnet-ssh-apply 2>/dev/null || true
+  ok "Filesystem artifacts removed."
+
+  # Remove the nftables traffic-accounting table created by the panel.
+  if command -v nft >/dev/null 2>&1; then
+    nft delete table inet xnet_accounting >/dev/null 2>&1 || true
+    ok "nftables accounting table removed."
+  fi
+
+  # Close the firewall rule for the panel port (best-effort).
+  if [ -n "$panel_port" ]; then
+    if command -v ufw >/dev/null 2>&1; then ufw delete allow "${panel_port}/tcp" >/dev/null 2>&1 || true; fi
+    if command -v firewall-cmd >/dev/null 2>&1; then
+      firewall-cmd --permanent --remove-port="${panel_port}/tcp" >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+    fi
+    ok "Firewall rule for panel port ${panel_port} removed."
+  fi
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  echo
+  ok "X-NET has been completely uninstalled."
+  echo "  Note: base packages (certbot, nftables, dropbear, stunnel4, …) and the main"
+  echo "  OpenSSH daemon were intentionally left untouched. Per-protocol inbound ports"
+  echo "  opened from the panel may still have firewall rules — review with:"
+  echo "    ufw status   /   firewall-cmd --list-ports"
+}
+
 menu() {
   while true; do
     echo
@@ -261,6 +411,7 @@ menu() {
     echo "  3) Panel port & login-path settings"
     echo "  4) Project health check"
     echo "  5) Restart services (panel / sing-box)"
+    echo -e "  6) ${C_RED}Uninstall X-NET (remove everything)${C_RESET}"
     echo "  0) Exit"
     read -r -p "  Choose: " c
     case "$c" in
@@ -269,6 +420,7 @@ menu() {
       3) do_config ;;
       4) do_health ;;
       5) do_restart ;;
+      6) do_uninstall ;;
       0|q|Q) exit 0 ;;
       *) warn "Invalid choice." ;;
     esac
@@ -281,9 +433,10 @@ case "${1:-}" in
   config|port|path)          do_config ;;
   health|healthcheck|check)  do_health ;;
   restart)                   shift || true; do_restart "${1:-}" ;;
+  uninstall|remove|purge)    do_uninstall ;;
   ""|menu)                   menu ;;
   -h|--help|help)
-    echo "Usage: xnet [deps|update|config|health|restart] (no args = interactive menu)"
+    echo "Usage: xnet [deps|update|config|health|restart|uninstall] (no args = interactive menu)"
     ;;
   *)
     err "Unknown command: $1"; echo "Run 'xnet help' for usage."; exit 1 ;;
