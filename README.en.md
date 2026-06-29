@@ -50,7 +50,7 @@ During the initial installation, the panel port and admin credentials are reques
 
 ### Node (Agent) Installation
 
-Run the same installation command on the node server and select `agent` as the role when prompted. Then in the panel, go to **Servers & Nodes → Register Node**; place the generated keys in `/opt/xnet/.env` on the node and restart the service:
+Run the same installation command on the node server and select the `agent` option when prompted for a role. Then in the panel, go to **Servers & Nodes → Register Node**; place the generated keys in `/opt/xnet/.env` on the node and restart the service:
 
 ```bash
 nano /opt/xnet/.env
@@ -90,8 +90,6 @@ systemctl restart xnet     # Restart service
 
 `SSH-over-WebSocket` · `Stunnel/TLS` · `SlowDNS` · `Dropbear` · `BadVPN/UDPGW`
 
----
-
 ## Features
 
 ### Inbound Management
@@ -104,7 +102,7 @@ Subscription link, QR Code, traffic limit, expiration date, concurrent device li
 Create system users, restrict traffic and concurrent login count
 
 ### Multi-Node
-panel/agent roles, automatic synchronization, and **single active node (Follow-Me)** with node switching from the subscription link
+panel/agent roles, automatic synchronization, and **single active node (Follow-Me)** with node switching via the subscription link
 
 ### Security
 JWT login, two-factor authentication (TOTP), access roles (Admin/Operator/Reseller), and HMAC signing between panel and node
@@ -123,8 +121,6 @@ Bearer token, documentation and playground, and IP whitelist firewall
 
 ### Interface
 Multi-language (Persian/English/Russian/Chinese), light and dark themes, automatic page updates
-
----
 
 ## License
 
