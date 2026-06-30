@@ -198,13 +198,18 @@ do_health() {
   [ -f "${INSTALL_DIR}/data/xnet.db" ] && ok "database: present" || warn "database: missing"
 
   # Clash API reachability — the source of VPN (sing-box) per-client traffic.
+  # The endpoint is protected by a Bearer secret, so an unauthenticated probe
+  # returns 401/403 — that still proves the API is UP (the panel collector holds
+  # the matching secret). Only a connection failure means it is truly down.
   if command -v curl >/dev/null 2>&1; then
-    if curl -fsS --max-time 5 "http://127.0.0.1:20091/connections" >/dev/null 2>&1; then
-      ok "sing-box Clash API (127.0.0.1:20091): reachable — VPN traffic accounting works"
-    else
-      warn "sing-box Clash API (127.0.0.1:20091): NOT reachable — VPN traffic will show 0"
-      warn "  → ensure sing-box is running and its config has the clash_api block (regenerate from the panel)"
-    fi
+    clash_code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:20091/connections" 2>/dev/null || echo 000)"
+    case "$clash_code" in
+      200|401|403)
+        ok "sing-box Clash API (127.0.0.1:20091): reachable (HTTP ${clash_code}) — VPN traffic accounting works" ;;
+      *)
+        warn "sing-box Clash API (127.0.0.1:20091): NOT reachable (HTTP ${clash_code}) — VPN traffic will show 0"
+        warn "  → ensure sing-box is running and its config has the clash_api block (regenerate from the panel)" ;;
+    esac
   fi
 
   # Local API ping.

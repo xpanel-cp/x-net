@@ -13,6 +13,7 @@
 #
 #  Exit codes: 0 = success, 1 = usage/input error, 2 = partial apply error
 # ============================================================
+# XNET_SSH_APPLY_VERSION=6   (v6: remove legacy stunnel xnet-ssh.conf that hardcoded connect=:22; TLS forwards only to sshd_tls:2223)
 set -uo pipefail
 
 SETTINGS_FILE="${1:-/opt/xnet/ssh-settings.json}"
@@ -52,6 +53,22 @@ PY
 
 HAD_ERROR=0
 
+# unit_exists returns 0 if a systemd unit is installed on this host (either as a
+# unit file or a loaded/generated unit), 1 otherwise. Used to avoid treating an
+# optional, not-installed unit (e.g. a WS sshd that is panel-managed in-process)
+# as a hard apply failure.
+unit_exists() {
+  local unit="$1"
+  # Normalize: allow callers to pass "name" or "name.service".
+  case "$unit" in
+    *.*) : ;;
+    *)   unit="${unit}.service" ;;
+  esac
+  systemctl list-unit-files "$unit" >/dev/null 2>&1 \
+    && systemctl list-unit-files "$unit" 2>/dev/null | grep -q "$unit" && return 0
+  systemctl cat "$unit" >/dev/null 2>&1
+}
+
 restart_unit() {
   local unit="$1"
   systemctl daemon-reload 2>/dev/null || true
@@ -59,6 +76,21 @@ restart_unit() {
   if ! systemctl restart "$unit" >/dev/null 2>&1; then
     systemctl start "$unit" >/dev/null 2>&1 || { log "warning: failed to start $unit"; HAD_ERROR=1; }
   fi
+}
+
+# restart_first_existing restarts the first installed unit from the given list.
+# If none of the candidate units exist, it does NOT flag HAD_ERROR — the caller
+# treats a missing optional unit as "nothing to do" (returns non-zero so callers
+# can branch). Returns 0 if a unit was found and a restart attempted.
+restart_first_existing() {
+  local u
+  for u in "$@"; do
+    if unit_exists "$u"; then
+      restart_unit "$u"
+      return 0
+    fi
+  done
+  return 1
 }
 
 stop_unit() {
@@ -69,6 +101,50 @@ stop_unit() {
     slowdns)      pkill -f dns-server >/dev/null 2>&1 || true ;;
     badvpn-udpgw) pkill -f badvpn-udpgw >/dev/null 2>&1 || true ;;
   esac
+}
+
+# open_fw_port opens a TCP port in whichever firewall is active (ufw or
+# firewalld). Best-effort and idempotent; does nothing if no managed firewall is
+# running. Used so a port change from the panel never silently locks out access.
+open_fw_port() {
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] || return 0
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow "${p}/tcp" >/dev/null 2>&1 || true
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null 2>&1 || true
+    firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+}
+
+# ensure_login_group_membership is an ANTI-LOCKOUT safety net. The main sshd is
+# protected by `AllowGroups ssh-tcp-users` (added by xnet-install-sshd.sh). When
+# the panel changes the OpenSSH port we restart sshd, which makes that directive
+# take effect. If the administrative login user is NOT in the allowed group, the
+# restart would lock them out. So, whenever sshd_config carries an AllowGroups
+# line that includes ssh-tcp-users, guarantee that root (the universal fallback
+# admin) — and the panel's configured SSH admin, if any — belong to that group.
+# This NEVER edits the AllowGroups directive itself (only group membership), so
+# protocol isolation is preserved.
+ensure_login_group_membership() {
+  local cfg=/etc/ssh/sshd_config
+  [ -f "$cfg" ] || return 0
+  # Only act when the main sshd actually restricts logins by group.
+  grep -qiE '^[[:space:]]*AllowGroups[[:space:]].*\bssh-tcp-users\b' "$cfg" || return 0
+
+  command -v groupadd >/dev/null 2>&1 && groupadd -f ssh-tcp-users >/dev/null 2>&1 || true
+
+  local u
+  for u in root "${XNET_SSH_ADMIN_USER:-}"; do
+    [ -n "$u" ] || continue
+    id "$u" >/dev/null 2>&1 || continue
+    if ! id -nG "$u" 2>/dev/null | tr ' ' '\n' | grep -qx ssh-tcp-users; then
+      usermod -aG ssh-tcp-users "$u" >/dev/null 2>&1 \
+        && log "anti-lockout: added '$u' to ssh-tcp-users (AllowGroups is active)" \
+        || log "warning: could not add '$u' to ssh-tcp-users"
+    fi
+  done
 }
 
 # --- Helper: Update Port directive in sshd config (preserves AllowGroups) ----
@@ -93,6 +169,34 @@ apply_openssh() {
   if [[ "$port" =~ ^[0-9]+$ ]]; then
     update_sshd_port /etc/ssh/sshd_config "$port"
   fi
+
+  # Modern Ubuntu/Debian default to SSH socket activation (ssh.socket). The
+  # listening port is then controlled by the socket's ListenStream and the
+  # `Port` directive in sshd_config is ignored. Running BOTH ssh.socket and a
+  # standalone ssh.service that bind the same port causes systemd to flap (the
+  # daemon is repeatedly stopped/started), which surfaces to clients as
+  # "kex_exchange_identification: Connection reset" — i.e. you cannot log in on
+  # the new port even though everything looks configured.
+  #
+  # To make a custom port reliable we standardize on EXACTLY ONE mechanism:
+  # disable socket activation and let the classic ssh.service bind the Port from
+  # sshd_config (which we set above). This is the documented, stable way to run
+  # sshd on a custom port on socket-activated distros.
+  if [[ "$port" =~ ^[0-9]+$ ]]; then
+    local sock=""
+    if systemctl cat ssh.socket >/dev/null 2>&1; then sock="ssh.socket"
+    elif systemctl cat sshd.socket >/dev/null 2>&1; then sock="sshd.socket"; fi
+    if [ -n "$sock" ]; then
+      # Remove any stale xnet ListenStream drop-in written by older versions.
+      rm -f "/etc/systemd/system/${sock}.d/xnet-port.conf" 2>/dev/null || true
+      rmdir "/etc/systemd/system/${sock}.d" 2>/dev/null || true
+      # Stop + disable socket activation so the port is freed for ssh.service and
+      # the two mechanisms can no longer fight over it.
+      systemctl disable --now "$sock" >/dev/null 2>&1 || true
+      systemctl daemon-reload 2>/dev/null || true
+      log "OpenSSH: disabled ${sock} (socket activation) — using classic ssh.service on port ${port}"
+    fi
+  fi
   if [[ "$maxs" =~ ^[0-9]+$ ]] && [ "$maxs" -gt 0 ]; then
     if grep -qiE '^[#[:space:]]*MaxSessions[[:space:]]' /etc/ssh/sshd_config; then
       sed -i -E "s/^[#[:space:]]*MaxSessions[[:space:]].*/MaxSessions ${maxs}/I" /etc/ssh/sshd_config
@@ -101,6 +205,14 @@ apply_openssh() {
     fi
   fi
   grep -qiE '^[[:space:]]*AllowTcpForwarding[[:space:]]+yes' /etc/ssh/sshd_config || echo "AllowTcpForwarding yes" >> /etc/ssh/sshd_config
+
+  # ANTI-LOCKOUT: before (re)starting sshd on the new port, make sure the admin
+  # is still permitted by AllowGroups and that the new port is reachable through
+  # any active firewall. Without these, a port change can lock the operator out.
+  ensure_login_group_membership
+  if [ "$enabled" = "true" ] && [[ "$port" =~ ^[0-9]+$ ]]; then
+    open_fw_port "$port"
+  fi
 
   local unit="ssh"
   systemctl list-unit-files ssh.service 2>/dev/null | grep -q ssh.service || unit="sshd"
@@ -120,10 +232,17 @@ apply_ws_sshd() {
   fi
 
   if [ "$enabled" = "true" ]; then
-    restart_unit xnet-ws 2>/dev/null || restart_unit sshd-ws 2>/dev/null || true
+    # The WS sshd unit is named sshd-ws on a standard install (see
+    # xnet-install-sshd.sh). Older/alternate deployments may use xnet-ws.
+    # If neither unit is installed, the WebSocket path is served by the
+    # panel-managed in-process proxy and there is nothing to restart — that is
+    # NOT an error, so do not flag HAD_ERROR.
+    if ! restart_first_existing sshd-ws xnet-ws; then
+      log "WebSocket sshd: no sshd-ws/xnet-ws unit installed (panel-managed WS proxy) — skipping service restart"
+    fi
   else
-    stop_unit xnet-ws 2>/dev/null || true
-    stop_unit sshd-ws 2>/dev/null || true
+    unit_exists sshd-ws && stop_unit sshd-ws
+    unit_exists xnet-ws && stop_unit xnet-ws
   fi
 
   # Open firewall for the WS listener port (panel-managed WebSocket proxy)
@@ -155,6 +274,13 @@ apply_tls() {
   [[ "$port" =~ ^[0-9]+$ ]] || port=2083
   [[ "$ws_tls_port" =~ ^[0-9]+$ ]] || ws_tls_port=2084
 
+  # Heal legacy installs: older installers shipped /etc/stunnel/xnet-ssh.conf
+  # with a hardcoded `connect = 127.0.0.1:22`. stunnel loads every *.conf in
+  # /etc/stunnel, so that stale file keeps dialing the main sshd and breaks the
+  # moment the OpenSSH port changes. We forward TLS only to the dedicated
+  # sshd_tls (127.0.0.1:2223) via stunnel.conf, so remove the legacy file.
+  rm -f /etc/stunnel/xnet-ssh.conf 2>/dev/null || true
+
   if [ -f /etc/ssh/sshd_config_tls ]; then
     update_sshd_port /etc/ssh/sshd_config_tls "$sshd_tls_port"
   fi
@@ -167,7 +293,7 @@ apply_tls() {
   fi
 
   # Restart sshd-tls
-  restart_unit sshd-tls 2>/dev/null || true
+  unit_exists sshd-tls && restart_unit sshd-tls
 
   # Configure stunnel with two sections:
   # 1. ssh-tls-direct: accepts on TLS port, forwards raw SSH to sshd_tls
@@ -230,7 +356,7 @@ apply_slowdns() {
   fi
 
   # Restart sshd-dns
-  restart_unit sshd-dns 2>/dev/null || true
+  unit_exists sshd-dns && restart_unit sshd-dns
 
   bin="$(command -v dns-server || command -v sldns-server || echo /usr/local/bin/dns-server)"
   if [ ! -x "$bin" ]; then

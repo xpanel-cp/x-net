@@ -110,10 +110,23 @@ prompt_credentials() {
   echo -e "${C_BOLD}  Panel Administrator Account${C_RESET}"
   echo -e "${C_BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${C_RESET}"
   echo
-  read -r -p "  Admin username (default: admin): " ADMIN_USERNAME
-  ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
+  # Admin username — allow ONLY English letters, digits, dot, underscore and
+  # hyphen. Anything else (spaces, non-English characters, or stray non-UTF-8
+  # bytes from a paste) is rejected and the prompt repeats. This is required
+  # because systemd refuses to load the whole .env if any value is not valid
+  # UTF-8, which silently stops the panel service (Result: resources).
+  local uname_leftover
+  while true; do
+    read -r -p "  Admin username (default: admin): " ADMIN_USERNAME
+    ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
+    uname_leftover="$(printf '%s' "$ADMIN_USERNAME" | LC_ALL=C tr -d 'A-Za-z0-9._-')"
+    if [ -z "$uname_leftover" ]; then
+      break
+    fi
+    warn "Username may contain only English letters, digits, and . _ - (no spaces or other characters). Please try again."
+  done
 
-  local p1 p2
+  local p1 p2 pw_leftover
   while true; do
     read -r -s -p "  Admin password (leave empty to auto-generate): " p1; echo
     if [ -z "$p1" ]; then
@@ -121,6 +134,14 @@ prompt_credentials() {
       PASSWORD_GENERATED="true"
       ok "A strong password was generated automatically."
       break
+    fi
+    # Allow only printable ASCII (English letters, digits, standard symbols) —
+    # no spaces, control characters, or non-English characters — for the same
+    # systemd/.env UTF-8 reason as the username.
+    pw_leftover="$(printf '%s' "$p1" | LC_ALL=C tr -d '!-~')"
+    if [ -n "$pw_leftover" ]; then
+      warn "Password may contain only English letters, digits, and standard symbols (no spaces or non-English characters). Try again."
+      continue
     fi
     read -r -s -p "  Confirm password: " p2; echo
     if [ "$p1" != "$p2" ]; then
@@ -585,13 +606,20 @@ ensure_stunnel_unit() {
       -keyout /etc/ssl/xnet/key.pem -out /etc/ssl/xnet/cert.pem \
       -subj "/CN=xnet-ssh-tls" >/dev/null 2>&1 || true
   fi
-  cat > /etc/stunnel/xnet-ssh.conf <<'EOF'
-; X-Net SSH-over-TLS tunnel (managed by the panel). The panel starts/stops the
-; stunnel4 service when the TLS protocol is toggled.
-pid = /var/run/stunnel-xnet.pid
-[ssh-tls]
+  # The panel's apply helper (xnet-ssh-apply) owns /etc/stunnel/stunnel.conf and
+  # forwards SSH-over-TLS to the DEDICATED sshd_tls instance on 127.0.0.1:2223,
+  # which is independent of the main OpenSSH port. Remove any legacy single-file
+  # config that hardcoded connect=127.0.0.1:22 — that one breaks the moment the
+  # operator changes the main OpenSSH port (stunnel keeps dialing the dead :22).
+  rm -f /etc/stunnel/xnet-ssh.conf 2>/dev/null || true
+  cat > /etc/stunnel/stunnel.conf <<'EOF'
+; X-Net SSH-over-TLS tunnel (bootstrap — the panel rewrites this on TLS apply).
+; Forwards to the dedicated sshd_tls instance (127.0.0.1:2223), NOT the main
+; sshd, so changing the OpenSSH port never breaks the TLS tunnel.
+pid = /var/run/stunnel4.pid
+[ssh-tls-direct]
 accept = 443
-connect = 127.0.0.1:22
+connect = 127.0.0.1:2223
 cert = /etc/ssl/xnet/cert.pem
 key = /etc/ssl/xnet/key.pem
 EOF
@@ -687,14 +715,21 @@ build_badvpn_udpgw() {
   rm -rf "$src" 2>/dev/null || true
   if git clone --depth 1 https://github.com/ambrop72/badvpn.git "$src" >/dev/null 2>&1; then
     mkdir -p "$src/build"
+    local blog="/tmp/xnet-badvpn-build.log"
+    # badvpn is old C. Modern toolchains (e.g. gcc 14 on Ubuntu 24.04) promote
+    # implicit function declarations / incompatible-pointer / int-conversion
+    # warnings to HARD ERRORS, which breaks the build and leaves UDPGW
+    # uninstalled. Relax those so the udpgw component compiles, and capture the
+    # build output to $blog so a genuine failure is diagnosable (fail-loud)
+    # instead of a silent skip.
     if ( cd "$src/build" \
-          && cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null 2>&1 \
-          && make >/dev/null 2>&1 \
-          && [ -f udpgw/badvpn-udpgw ] ); then
+          && cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 \
+               -DCMAKE_C_FLAGS="-fcommon -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types" \
+          && make ) >"$blog" 2>&1 && [ -f "$src/build/udpgw/badvpn-udpgw" ]; then
       install -m 0755 "$src/build/udpgw/badvpn-udpgw" "$dst"
       ok "badvpn-udpgw built and installed to ${dst}."
     else
-      warn "badvpn-udpgw build failed; UDPGW will be unavailable until installed manually."
+      warn "badvpn-udpgw build failed; see ${blog} for the compiler error. UDPGW will be unavailable until installed."
     fi
   else
     warn "Could not clone badvpn source; UDPGW will be unavailable until installed manually."
@@ -882,6 +917,11 @@ deploy_files() {
   mkdir -p "${INSTALL_DIR}/data"
   mkdir -p /etc/sing-box
   mkdir -p /etc/ssh
+  # ACME HTTP-01 webroot — served by the panel's port-80 WebSocket proxy so
+  # Let's Encrypt can validate via --webroot without certbot needing to bind
+  # port 80 itself. Owned by the service user so the panel's health check can
+  # write test tokens; certbot runs as root and can also write here.
+  mkdir -p /var/lib/xnet/acme/.well-known/acme-challenge
 
   # Stop service if running
   if systemctl is-active --quiet xnet 2>/dev/null; then
@@ -903,6 +943,10 @@ deploy_files() {
 
   # --- SSH apply helper script ---
   install -m 0755 "$SCRIPT_DIR/xnet-ssh-apply" "${INSTALL_DIR}/xnet-ssh-apply"
+  # Strip any CR (\r) so a helper shipped/edited with Windows CRLF line endings
+  # never breaks the shebang ("/usr/bin/env: 'bash\r': No such file or directory").
+  sed -i 's/\r$//' "${INSTALL_DIR}/xnet-ssh-apply" 2>/dev/null || true
+  chmod 0755 "${INSTALL_DIR}/xnet-ssh-apply"
   ln -sf "${INSTALL_DIR}/xnet-ssh-apply" /usr/local/bin/xnet-ssh-apply
   ok "xnet-ssh-apply helper installed."
 
@@ -925,6 +969,8 @@ deploy_files() {
 
   # --- Ownership (MUST come before setcap — chown strips capabilities!) ---
   chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}" /etc/sing-box
+  chown -R "${SERVICE_USER}:${SERVICE_USER}" /var/lib/xnet 2>/dev/null || true
+  chmod 0755 /var/lib/xnet /var/lib/xnet/acme 2>/dev/null || true
   ok "File permissions set."
 
   # --- setcap AFTER chown (chown strips extended attributes including caps) ---
@@ -970,8 +1016,8 @@ xnet ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload, /bin/systemctl daemo
 # Privileged helpers (trailing-arg wildcard is permitted by sudo)
 xnet ALL=(root) NOPASSWD: /opt/xnet/xnet-ssh-apply, /opt/xnet/xnet-ssh-apply *
 xnet ALL=(root) NOPASSWD: /opt/xnet/xnet-cert-install, /opt/xnet/xnet-cert-install *
-# TLS certificate management
-xnet ALL=(root) NOPASSWD: /usr/bin/certbot, /bin/certbot
+# TLS certificate management (issuance needs args: certonly --webroot/--standalone ...)
+xnet ALL=(root) NOPASSWD: /usr/bin/certbot, /usr/bin/certbot *, /bin/certbot, /bin/certbot *
 # Panel self-restart via a transient unit (separate cgroup) so the restart
 # survives the xnet service being stopped. Trailing wildcard is permitted.
 xnet ALL=(root) NOPASSWD: /usr/bin/systemd-run *, /bin/systemd-run *
@@ -981,7 +1027,7 @@ EOF
   {
     echo "# systemctl control for managed services (explicit verb+service)"
     local svc verb sc
-    for svc in sing-box sshd ssh sshd-ws sshd-tls sshd-dns xnet-ws dropbear stunnel4 badvpn-udpgw slowdns xnet; do
+    for svc in sing-box sshd ssh ssh.socket sshd.socket sshd-ws sshd-tls sshd-dns xnet-ws dropbear stunnel4 badvpn-udpgw slowdns xnet; do
       for sc in /usr/bin/systemctl /bin/systemctl; do
         for verb in start stop restart reload status is-active enable disable; do
           echo "xnet ALL=(root) NOPASSWD: ${sc} ${verb} ${svc}"

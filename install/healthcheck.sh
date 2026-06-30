@@ -134,12 +134,18 @@ fi
 
 # ----- 4. frontend served ----------------------------------------------------
 head "4. Frontend"
-code="$(http_code GET "$BASE/")"
+# The SPA is served under the secret WEB_BASE_PATH (obscured panel URL), NOT at
+# "/". Read it from .env so we probe the real path instead of falsely reporting
+# a 404 on "/".
+WEB_BASE_PATH="$(env_get WEB_BASE_PATH || true)"
+fe_path="${WEB_BASE_PATH:-/}"
+case "$fe_path" in /*) ;; *) fe_path="/$fe_path" ;; esac
+code="$(http_code GET "$BASE$fe_path")"
 body="$(cat "$BODY_FILE")"
 if [ "$code" = "200" ] && echo "$body" | grep -qi '<!doctype html\|<div id="root"\|<html'; then
-  ok "GET / serves the SPA (HTML)"
+  ok "GET ${fe_path} serves the SPA (HTML)"
 else
-  bad "GET / → HTTP ${code} (frontend not served? STATIC_DIR set?)"
+  bad "GET ${fe_path} → HTTP ${code} (frontend not served? STATIC_DIR / WEB_BASE_PATH?)"
 fi
 
 # ----- 5. login --------------------------------------------------------------
@@ -272,6 +278,11 @@ if [ "$clash_resp" = "200" ]; then
   # Show connection count
   conn_count="$(curl -s http://127.0.0.1:20091/connections 2>/dev/null | python3 -c "import sys,json;d=json.load(sys.stdin);print(len(d.get('connections') or []))" 2>/dev/null || echo "?")"
   note "Active connections: ${conn_count}"
+elif [ "$clash_resp" = "401" ] || [ "$clash_resp" = "403" ]; then
+  # 401/403 proves the Clash API is up and protected by a Bearer secret. The
+  # panel's own collector authenticates with the matching secret, so this is
+  # healthy — an unauthenticated probe is simply not allowed.
+  ok "Clash API reachable (HTTP ${clash_resp}: secret-protected; the panel collector authenticates internally)"
 else
   bad "Clash API /connections → HTTP ${clash_resp} (sing-box not running or port 20091 blocked)"
 fi
