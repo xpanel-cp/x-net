@@ -227,9 +227,9 @@ apply_ws_sshd() {
   port="$(jget '.websocket.port' '2222')"
   [[ "$port" =~ ^[0-9]+$ ]] || port=2222
 
-  if [ -f /etc/ssh/sshd_config_ws ]; then
-    update_sshd_port /etc/ssh/sshd_config_ws "$port"
-  fi
+  # IMPORTANT: Do NOT change the internal sshd-ws port. It is always 2222 
+  # (127.0.0.1 only). The panel's in-process WS proxy handles the public port.
+  # Only enable/disable the unit.
 
   if [ "$enabled" = "true" ]; then
     # The WS sshd unit is named sshd-ws on a standard install (see
@@ -281,9 +281,8 @@ apply_tls() {
   # sshd_tls (127.0.0.1:2223) via stunnel.conf, so remove the legacy file.
   rm -f /etc/stunnel/xnet-ssh.conf 2>/dev/null || true
 
-  if [ -f /etc/ssh/sshd_config_tls ]; then
-    update_sshd_port /etc/ssh/sshd_config_tls "$sshd_tls_port"
-  fi
+  # IMPORTANT: Do NOT change sshd-tls internal port (2223). stunnel handles
+  # the public port and forwards to 127.0.0.1:2223.
 
   if [ "$enabled" != "true" ]; then
     stop_unit stunnel4

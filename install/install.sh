@@ -542,9 +542,10 @@ install_ssh_subsystems() {
   ok "SSH tunneling subsystems prepared (managed by the panel on demand)."
 }
 
-# ensure_dropbear_unit writes a clean dropbear.service running on port 444 (the
-# panel's default Dropbear port) with its own host keys, independent of the
-# distro init so it never collides with OpenSSH on port 22. Created disabled.
+# ensure_dropbear_unit writes a clean dropbear.service running on the configured
+# port (default 444). On upgrade, if the service file already exists, it is NOT
+# overwritten so admin port changes from the panel are preserved. Only on fresh
+# install the default port 444 is written.
 ensure_dropbear_unit() {
   local bin keybin
   bin="$(command -v dropbear 2>/dev/null || echo /usr/sbin/dropbear)"
@@ -565,7 +566,10 @@ ensure_dropbear_unit() {
   # Generate dropbear-format host keys once (idempotent).
   [ -f /etc/dropbear/dropbear_rsa_host_key ]     || "$keybin" -t rsa     -f /etc/dropbear/dropbear_rsa_host_key     >/dev/null 2>&1 || true
   [ -f /etc/dropbear/dropbear_ed25519_host_key ] || "$keybin" -t ed25519 -f /etc/dropbear/dropbear_ed25519_host_key >/dev/null 2>&1 || true
-  cat > /etc/systemd/system/dropbear.service <<EOF
+
+  # Only write the service file on FRESH install (preserve admin port changes on upgrade)
+  if [ ! -f /etc/systemd/system/dropbear.service ]; then
+    cat > /etc/systemd/system/dropbear.service <<EOF
 [Unit]
 Description=Dropbear SSH (X-Net managed)
 After=network.target
@@ -579,14 +583,22 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  # Restrict Dropbear (port 444) logins to the ssh-dropbear-users group when the
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
+
+  # Ensure /bin/false and /usr/sbin/nologin are listed in /etc/shells so Dropbear
+  # accepts login for SSH tunnel users (created with these shells by the panel).
+  for sh in /bin/false /usr/sbin/nologin; do
+    grep -qxF "$sh" /etc/shells 2>/dev/null || echo "$sh" >> /etc/shells
+  done
+
+  # Restrict Dropbear logins to the ssh-dropbear-users group when the
   # PAM hook exists, so only Dropbear accounts can use it.
   if [ -f /etc/pam.d/dropbear ] && ! grep -q 'ssh-dropbear-users' /etc/pam.d/dropbear 2>/dev/null; then
     sed -i '1a auth required pam_succeed_if.so user ingroup ssh-dropbear-users' /etc/pam.d/dropbear 2>/dev/null || true
   fi
   systemctl enable --now dropbear >/dev/null 2>&1 || true
-  ok "Dropbear unit ready and started (port 444)."
+  ok "Dropbear unit ready and started."
 }
 
 # ensure_stunnel_unit prepares stunnel4 with a self-signed cert and a config that
@@ -691,7 +703,26 @@ build_badvpn_udpgw() {
     *) dl_arch="" ;;
   esac
   local url="${XNET_UDPGW_URL:-}"
-  if [ -n "$url" ]; then
+  # Try known prebuilt mirrors when no explicit URL is set
+  if [ -z "$url" ] && [ -n "$dl_arch" ]; then
+    local mirrors=(
+      "https://github.com/AliDbg/SH/raw/main/badvpn/badvpn-udpgw-linux-${dl_arch}"
+      "https://github.com/fisabiliyusri/Lunatic/raw/main/badvpn/badvpn-udpgw"
+      "https://raw.githubusercontent.com/MrAminiDev/tunnelMaster/main/badvpn/badvpn-udpgw64"
+    )
+    for mirror in "${mirrors[@]}"; do
+      if curl -fsSL --connect-timeout 10 "$mirror" -o "$dst" 2>/dev/null && [ -s "$dst" ]; then
+        chmod 0755 "$dst"
+        # Verify it's an actual ELF binary, not an HTML 404 page
+        if file "$dst" 2>/dev/null | grep -qi "ELF"; then
+          ok "badvpn-udpgw installed from prebuilt mirror."
+          return 0
+        fi
+        rm -f "$dst" 2>/dev/null || true
+      fi
+      rm -f "$dst" 2>/dev/null || true
+    done
+  elif [ -n "$url" ]; then
     if curl -fsSL "$url" -o "$dst" 2>/dev/null && [ -s "$dst" ]; then
       chmod 0755 "$dst"; ok "badvpn-udpgw installed from XNET_UDPGW_URL."; return 0
     fi
@@ -701,7 +732,7 @@ build_badvpn_udpgw() {
   # --- 2) build from source ---
   info "Building badvpn-udpgw from source (best-effort)…"
   if command -v apt-get >/dev/null 2>&1; then
-    apt_install git cmake make gcc build-essential || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y git cmake make gcc g++ build-essential >/dev/null 2>&1 || true
   elif command -v dnf >/dev/null 2>&1; then
     dnf install -y git cmake make gcc gcc-c++ >/dev/null 2>&1 || true
   elif command -v yum >/dev/null 2>&1; then
@@ -724,8 +755,9 @@ build_badvpn_udpgw() {
     # instead of a silent skip.
     if ( cd "$src/build" \
           && cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 \
-               -DCMAKE_C_FLAGS="-fcommon -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types" \
-          && make ) >"$blog" 2>&1 && [ -f "$src/build/udpgw/badvpn-udpgw" ]; then
+               -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+               -DCMAKE_C_FLAGS="-fcommon -Wno-error -Wno-implicit-function-declaration -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-discarded-qualifiers" \
+          && make -j"$(nproc 2>/dev/null || echo 1)" ) >"$blog" 2>&1 && [ -f "$src/build/udpgw/badvpn-udpgw" ]; then
       install -m 0755 "$src/build/udpgw/badvpn-udpgw" "$dst"
       ok "badvpn-udpgw built and installed to ${dst}."
     else
@@ -753,16 +785,56 @@ ensure_slowdns_unit() {
     esac
     local url="${XNET_DNSTT_URL:-}"
     if [ -z "$url" ] && [ -n "$dl_arch" ]; then
-      # Maintained dnstt-server prebuilt mirror; override with XNET_DNSTT_URL.
-      url="https://github.com/fisabiliyusri/Lunatic/raw/main/dnstt/dnstt-server-linux-${dl_arch}"
-    fi
-    if [ -n "$url" ]; then
+      # Try multiple mirrors for dnstt-server binary
+      local mirrors=(
+        "https://github.com/AliDbg/SH/raw/main/dnstt/dnstt-server-linux-${dl_arch}"
+        "https://github.com/fisabiliyusri/Lunatic/raw/main/dnstt/dnstt-server-linux-${dl_arch}"
+        "https://github.com/MrAminiDev/tunnelMaster/raw/main/dnstt/dnstt-server"
+        "https://github.com/nickoala/dnstt/releases/download/v0.20220208.0/dnstt-server-linux-${dl_arch}"
+      )
+      for mirror in "${mirrors[@]}"; do
+        if curl -fsSL --connect-timeout 10 "$mirror" -o "$bin" 2>/dev/null && [ -s "$bin" ]; then
+          # Verify it's an actual binary, not an HTML 404 page
+          if file "$bin" 2>/dev/null | grep -qi "ELF"; then
+            chmod 0755 "$bin"
+            ok "SlowDNS dnstt server installed to ${bin}."
+            url="done"
+            break
+          fi
+          rm -f "$bin" 2>/dev/null || true
+        fi
+        rm -f "$bin" 2>/dev/null || true
+      done
+      # If download failed, try building from Go source
+      if [ "$url" != "done" ] && command -v go >/dev/null 2>&1; then
+        info "Trying to build dnstt from Go source…"
+        if GOBIN=/usr/local/bin go install www.bamsoftware.com/git/dnstt.git/dnstt-server@latest 2>/dev/null; then
+          if [ -x "/usr/local/bin/dnstt-server" ]; then
+            mv /usr/local/bin/dnstt-server "$bin"
+            ok "SlowDNS dnstt server built from Go source."
+            url="done"
+          fi
+        fi
+      fi
+      # Final fallback: use the bundled binary shipped with the installer
+      if [ "$url" != "done" ]; then
+        local bundled="$(dirname "$(readlink -f "$0")")/dns-server"
+        if [ -f "$bundled" ] && file "$bundled" 2>/dev/null | grep -qi "ELF"; then
+          install -m 0755 "$bundled" "$bin"
+          ok "SlowDNS dnstt server installed from bundled binary."
+          url="done"
+        fi
+      fi
+      if [ "$url" != "done" ]; then
+        warn "Could not auto-download the SlowDNS (dnstt) server from any mirror. Install /usr/local/bin/dns-server manually to enable SlowDNS."
+      fi
+    elif [ -n "$url" ]; then
       if curl -fsSL "$url" -o "$bin" 2>/dev/null && [ -s "$bin" ]; then
         chmod 0755 "$bin"
         ok "SlowDNS dnstt server installed to ${bin}."
       else
         rm -f "$bin" 2>/dev/null || true
-        warn "Could not auto-download the SlowDNS (dnstt) server. Set XNET_DNSTT_URL and re-run, or install /usr/local/bin/dns-server manually."
+        warn "Could not download dnstt from ${url}."
       fi
     fi
   fi
@@ -822,6 +894,8 @@ setup_secondary_sshd() {
     svc="${entry%%:*}"
     port="$(echo "$entry" | cut -d: -f2)"
     grp="$(echo "$entry" | cut -d: -f3)"
+    # ALWAYS write internal sshd configs with fixed ports (2222/2223/2224).
+    # These are internal-only (127.0.0.1). Panel proxy handles public ports.
     cat > "/etc/ssh/sshd_config_${svc}" <<EOF
 Port ${port}
 ListenAddress 127.0.0.1
