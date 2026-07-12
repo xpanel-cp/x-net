@@ -403,11 +403,11 @@ apply_dropbear() {
     } > /etc/default/dropbear
   fi
 
-  if systemctl list-unit-files dropbear.service 2>/dev/null | grep -q dropbear.service; then
-    restart_unit dropbear
-  else
-    local bin; bin="$(command -v dropbear || echo /usr/sbin/dropbear)"
-    cat > /etc/systemd/system/dropbear.service <<UNIT
+  # Always ensure the systemd unit file has the correct port in ExecStart.
+  # This is critical: many systems ignore /etc/default/dropbear and only use
+  # the -p flag in the ExecStart line of the service file.
+  local bin; bin="$(command -v dropbear || echo /usr/sbin/dropbear)"
+  cat > /etc/systemd/system/dropbear.service <<UNIT
 [Unit]
 Description=Dropbear SSH server (xnet-managed)
 After=network.target
@@ -417,8 +417,12 @@ Restart=on-failure
 [Install]
 WantedBy=multi-user.target
 UNIT
-    restart_unit dropbear
-  fi
+  # Remove any stale override that might conflict
+  rm -f /etc/systemd/system/dropbear.service.d/port-override.conf 2>/dev/null || true
+  rmdir /etc/systemd/system/dropbear.service.d 2>/dev/null || true
+
+  open_fw_port "$port"
+  restart_unit dropbear
   log "Dropbear: port=${port}"
 }
 
