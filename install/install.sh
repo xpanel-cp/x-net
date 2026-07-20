@@ -1164,7 +1164,11 @@ Group=${SERVICE_USER}
 WorkingDirectory=${INSTALL_DIR}
 EnvironmentFile=${INSTALL_DIR}/.env
 ExecStart=${INSTALL_DIR}/xnet-server
-Restart=on-failure
+# Restart=always so the panel comes back after a restore-triggered self-exit
+# (the restore flow re-execs the process to load the new database). The restore
+# code also schedules an explicit systemd-run restart as the primary path, so
+# this is defence in depth and independent of the exit code.
+Restart=always
 RestartSec=3
 # NoNewPrivileges must be false so sudo can escalate for useradd/systemctl.
 NoNewPrivileges=false
