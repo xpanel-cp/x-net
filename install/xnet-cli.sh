@@ -405,6 +405,61 @@ EOF
   echo "    ufw status   /   firewall-cmd --list-ports"
 }
 
+# ---- server timezone --------------------------------------------------------
+# Sets the server timezone (affects how imported-user expiry dates — X-Panel /
+# Shahan — are interpreted, and expiry enforcement). Interactive menu with a
+# custom entry and a "keep current" option. Non-interactive: `xnet timezone
+# Asia/Tehran` sets it directly.
+do_timezone() {
+  need_root
+  local arg="${1:-}"
+  local tz=""
+  local cur; cur="$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo 'unknown')"
+
+  if [ -n "$arg" ]; then
+    tz="$arg"
+  else
+    echo
+    echo -e "${C_BOLD}Server Timezone${C_RESET}"
+    echo -e "  Current: ${C_BOLD}${cur}${C_RESET}"
+    echo -e "  Used to interpret imported-user expiry dates (X-Panel / Shahan)."
+    echo "    1) Asia/Tehran      (Iran)"
+    echo "    2) UTC"
+    echo "    3) Europe/Moscow    (Russia)"
+    echo "    4) Asia/Shanghai    (China)"
+    echo "    5) Asia/Dubai"
+    echo "    6) Europe/Istanbul"
+    echo "    7) Custom (enter an IANA name, e.g. Europe/Berlin)"
+    echo "    0) Keep current (don't change)"
+    read -r -p "  Choose [1-7, 0 to keep]: " c
+    case "${c:-0}" in
+      1) tz="Asia/Tehran" ;;
+      2) tz="UTC" ;;
+      3) tz="Europe/Moscow" ;;
+      4) tz="Asia/Shanghai" ;;
+      5) tz="Asia/Dubai" ;;
+      6) tz="Europe/Istanbul" ;;
+      7) read -r -p "  Enter IANA timezone: " tz; tz="$(echo "$tz" | tr -d ' ')" ;;
+      0|"") info "Timezone left unchanged (${cur})."; return 0 ;;
+      *) warn "Invalid choice — leaving timezone unchanged."; return 0 ;;
+    esac
+  fi
+
+  [ -n "$tz" ] || { warn "No timezone given — unchanged."; return 0; }
+  if [ ! -e "/usr/share/zoneinfo/$tz" ]; then
+    err "Timezone '$tz' not found in /usr/share/zoneinfo — leaving unchanged."; return 1
+  fi
+  if command -v timedatectl >/dev/null 2>&1; then
+    if timedatectl set-timezone "$tz" >/dev/null 2>&1; then
+      ok "Server timezone set to ${tz}."
+    else
+      err "Could not set timezone to ${tz} (timedatectl failed)."; return 1
+    fi
+  else
+    err "timedatectl not available — set the timezone manually to ${tz}."; return 1
+  fi
+}
+
 menu() {
   while true; do
     echo
@@ -416,7 +471,8 @@ menu() {
     echo "  3) Panel port & login-path settings"
     echo "  4) Project health check"
     echo "  5) Restart services (panel / sing-box)"
-    echo -e "  6) ${C_RED}Uninstall X-NET (remove everything)${C_RESET}"
+    echo "  6) Server timezone"
+    echo -e "  7) ${C_RED}Uninstall X-NET (remove everything)${C_RESET}"
     echo "  0) Exit"
     read -r -p "  Choose: " c
     case "$c" in
@@ -425,7 +481,8 @@ menu() {
       3) do_config ;;
       4) do_health ;;
       5) do_restart ;;
-      6) do_uninstall ;;
+      6) do_timezone ;;
+      7) do_uninstall ;;
       0|q|Q) exit 0 ;;
       *) warn "Invalid choice." ;;
     esac
@@ -438,10 +495,11 @@ case "${1:-}" in
   config|port|path)          do_config ;;
   health|healthcheck|check)  do_health ;;
   restart)                   shift || true; do_restart "${1:-}" ;;
+  timezone|tz)               shift || true; do_timezone "${1:-}" ;;
   uninstall|remove|purge)    do_uninstall ;;
   ""|menu)                   menu ;;
   -h|--help|help)
-    echo "Usage: xnet [deps|update|config|health|restart|uninstall] (no args = interactive menu)"
+    echo "Usage: xnet [deps|update|config|health|restart|timezone|uninstall] (no args = interactive menu)"
     ;;
   *)
     err "Unknown command: $1"; echo "Run 'xnet help' for usage."; exit 1 ;;

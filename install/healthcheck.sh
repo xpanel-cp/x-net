@@ -262,10 +262,22 @@ if have sing-box; then
   fi
   sb_major="$(echo "$sb_ver" | cut -d. -f1)"
   sb_minor="$(echo "$sb_ver" | cut -d. -f2)"
-  if [ -n "$sb_major" ] && [ "$sb_major" -ge 1 ] 2>/dev/null && [ "$sb_minor" -ge 11 ] 2>/dev/null; then
+  if [ -z "$sb_ver" ]; then
+    # The X-NET prebuilt core is built without the version ldflag, so it reports
+    # "unknown". That's expected for a custom build — don't flag it as too old.
+    note "sing-box version: unknown (custom build — verify tags below)"
+  elif [ -n "$sb_major" ] && [ "$sb_major" -ge 1 ] 2>/dev/null && [ "$sb_minor" -ge 11 ] 2>/dev/null; then
     ok "sing-box version: v${sb_ver} (meets minimum 1.11)"
   else
     bad "sing-box version: v${sb_ver} — too old (need >= 1.11 for /connections metadata)"
+  fi
+  # with_v2ray_api enables AUTHORITATIVE per-UUID traffic accounting (the Clash
+  # API cannot expose the authenticated user). Official prebuilt binaries lack
+  # it; the installer builds sing-box from source with the tag when possible.
+  if sing-box version 2>/dev/null | grep -q "with_v2ray_api"; then
+    ok "sing-box built WITH with_v2ray_api (authoritative per-UUID accounting available)"
+  else
+    warn "sing-box built WITHOUT with_v2ray_api — per-user traffic for multi-client inbounds is degraded (Clash-only). Reinstall to build with the tag."
   fi
 else
   bad "sing-box binary not found in PATH"
@@ -287,6 +299,20 @@ else
   bad "Clash API /connections → HTTP ${clash_resp} (sing-box not running or port 20091 blocked)"
 fi
 
+# 8c-2. V2Ray Stats gRPC API (authoritative per-UUID accounting). Only present
+# when sing-box was built with with_v2ray_api AND the panel wrote the v2ray_api
+# block. It is a gRPC (HTTP/2) port, so a plain HTTP probe won't get 200 — we
+# only check that the port is listening.
+if have ss; then
+  if ss -ltn 2>/dev/null | grep -q ":20092 "; then
+    ok "V2Ray Stats API port 20092 is listening (authoritative per-UUID accounting active)"
+  elif sing-box version 2>/dev/null | grep -q "with_v2ray_api"; then
+    warn "sing-box has with_v2ray_api but port 20092 not listening yet (panel may not have written the v2ray_api block / not reloaded)"
+  else
+    note "V2Ray Stats API not active (sing-box lacks with_v2ray_api) — using Clash accounting"
+  fi
+fi
+
 # 8d. sing-box config validation (no deprecated dns outbound)
 SB_CFG="/etc/sing-box/config.json"
 if [ -f "$SB_CFG" ]; then
@@ -299,6 +325,11 @@ if [ -f "$SB_CFG" ]; then
     ok "sing-box config has clash_api block"
   else
     bad "sing-box config missing clash_api block (traffic stats will not work)"
+  fi
+  if grep -q "v2ray_api" "$SB_CFG" 2>/dev/null; then
+    ok "sing-box config has v2ray_api block (authoritative per-UUID accounting)"
+  else
+    note "sing-box config has no v2ray_api block (Clash-only accounting; expected if binary lacks with_v2ray_api)"
   fi
 else
   warn "sing-box config not found at ${SB_CFG}"
