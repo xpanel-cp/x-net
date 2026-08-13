@@ -4,13 +4,38 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>پنل مدیریت ورودی‌های Sing-box</title>
-    <!-- Preconnect to Google Fonts -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <!-- Import Vazirmatn for Persian, Inter for English, and JetBrains Mono for code -->
-    <link href="https://fonts.googleapis.com/css2?family=Vazirmatn:wght@300;400;500;600;700;800&family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@405;500;600;700&display=swap" rel="stylesheet">
-    <script type="module" crossorigin src="/assets/index-C2tTQ-tE.js"></script>
-    <link rel="stylesheet" crossorigin href="/assets/index-CncJIywU.css">
+    <!--
+      No external font CDN. Vazirmatn / Inter / JetBrains Mono are bundled with
+      the panel and imported from src/main.tsx, so the UI never reaches out to a
+      third-party host and renders identically on an offline or filtered network.
+    -->
+    <script>
+      // Apply the saved theme and direction BEFORE first paint.
+      //
+      // React applies both from an effect, which runs after the browser has
+      // already painted — so a reload flashed the light background at a
+      // dark-theme operator (and LTR at a Persian one) for a frame. The keys
+      // are the ones src/store.ts persists; the values are validated there, so
+      // anything unexpected here just falls back to the same defaults.
+      (function () {
+        try {
+          var t = localStorage.getItem("xnet_theme");
+          if (t !== "light") { t = "dark"; }
+          // Only the class is set here. The matching background lives in
+          // index.css (html.dark), so toggling the theme later cannot leave a
+          // stale inline style behind that overrides it.
+          if (t === "dark") { document.documentElement.classList.add("dark"); }
+          var l = localStorage.getItem("xnet_lang");
+          if (["en", "fa", "zh", "ru"].indexOf(l) === -1) { l = "fa"; }
+          document.documentElement.setAttribute("lang", l);
+          document.documentElement.setAttribute("dir", l === "fa" ? "rtl" : "ltr");
+        } catch (e) {
+          /* private mode: the React effects still apply everything a frame later */
+        }
+      })();
+    </script>
+    <script type="module" crossorigin src="/assets/index-B4h-gGMT.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-UgJ1JwXL.css">
   </head>
   <body>
     <div id="root"></div>

@@ -441,6 +441,35 @@ install_deps() {
   ok "System dependencies ready."
 }
 
+persist_tcp_early_demux() {
+  if [ "$(uname -s)" != "Linux" ]; then
+    return 0
+  fi
+  if ! command -v sysctl >/dev/null 2>&1; then
+    warn "sysctl not available; cannot persist net.ipv4.tcp_early_demux."
+    return 0
+  fi
+
+  if sysctl -w net.ipv4.tcp_early_demux=1 >/dev/null 2>&1; then
+    ok "Enabled net.ipv4.tcp_early_demux=1 for kernel socket-owner accounting."
+  else
+    warn "Could not enable net.ipv4.tcp_early_demux=1. Direct SSH download accounting may be incomplete."
+  fi
+
+  local sysctl_file="/etc/sysctl.d/99-xnet.conf"
+  mkdir -p "$(dirname "$sysctl_file")"
+  if [ -f "$sysctl_file" ]; then
+    if grep -q '^net\.ipv4\.tcp_early_demux=' "$sysctl_file" 2>/dev/null; then
+      sed -i 's/^net\.ipv4\.tcp_early_demux=.*/net.ipv4.tcp_early_demux=1/' "$sysctl_file"
+    else
+      echo 'net.ipv4.tcp_early_demux=1' >> "$sysctl_file"
+    fi
+  else
+    echo 'net.ipv4.tcp_early_demux=1' > "$sysctl_file"
+  fi
+  ok "Persisted net.ipv4.tcp_early_demux=1 to $sysctl_file."
+}
+
 # ----- install sing-box core --------------------------------------------------
 # The panel/agent shells out to the sing-box binary to apply inbound configs and
 # to collect per-user traffic. We pin an exact version and (re)install it when
@@ -708,6 +737,11 @@ install_ssh_subsystems() {
     yum install -y badvpn   >/dev/null 2>&1 || warn "yum could not install badvpn (UDPGW)."
   fi
 
+  # The account gate is set up even when dropbear itself failed to install:
+  # the shell it provisions accounts with is chosen by the panel regardless, and
+  # having the symlink already present means a dropbear installed later by hand
+  # is gated from its first start rather than briefly open to every account.
+  ensure_dropbear_user_gate
   ensure_dropbear_unit
   ensure_stunnel_unit
   ensure_udpgw_unit
@@ -715,6 +749,122 @@ install_ssh_subsystems() {
 
   systemctl daemon-reload >/dev/null 2>&1 || true
   ok "SSH tunneling subsystems prepared (managed by the panel on demand)."
+}
+
+# XNET_DROPBEAR_LOG is where Dropbear's own log goes, and it is load-bearing for
+# traffic accounting — not a convenience.
+#
+# Dropbear forks a child per connection and only setuids inside the fork that
+# execs a SHELL. A tunnel-only client (ssh -N / -D / -L, which is how these
+# accounts are used) never asks for one, so nothing ever runs as the account and
+# the account's UID owns no socket. Both kernel collectors key on the socket
+# owner's UID, so such an account measures EXACTLY 0 bytes and shows 0 online
+# however much it transfers. The only record of who owns a connection is the
+# authentication Dropbear logs — which carries the child PID, the account name
+# and the client endpoint — so the panel reads it and attributes each live
+# connection from there.
+#
+# It is written to a plain file rather than left to the journal because that is
+# the one source guaranteed readable by the unprivileged 'xnet' service user:
+# Ubuntu 24.04 minimal images ship no rsyslog (so /var/log/auth.log may not
+# exist) and journal access needs group membership the panel may not have. The
+# panel still falls back to auth.log and journalctl if this file is missing.
+XNET_DROPBEAR_LOG="/var/log/xnet/dropbear.log"
+
+# ensure_dropbear_logging makes Dropbear's log readable by the panel and keeps
+# it from growing without bound. Applied on every run (including upgrades), and
+# via a drop-in so it also covers a dropbear.service this installer did not
+# write.
+ensure_dropbear_logging() {
+  local had_dropin=1
+  [ -f /etc/systemd/system/dropbear.service.d/20-xnet-logging.conf ] || had_dropin=0
+  mkdir -p "$(dirname "$XNET_DROPBEAR_LOG")"
+  chmod 0755 "$(dirname "$XNET_DROPBEAR_LOG")" 2>/dev/null || true
+  [ -f "$XNET_DROPBEAR_LOG" ] || : > "$XNET_DROPBEAR_LOG"
+  chmod 0644 "$XNET_DROPBEAR_LOG" 2>/dev/null || true
+
+  # systemd's append: needs v240+ (Ubuntu 20.04 and newer). On anything older
+  # the drop-in is simply rejected and the panel falls back to the journal.
+  mkdir -p /etc/systemd/system/dropbear.service.d
+  cat > /etc/systemd/system/dropbear.service.d/20-xnet-logging.conf <<EOF
+# Managed by X-Net. Dropbear's auth lines are how the panel attributes
+# tunnel-only sessions to an account; see install.sh:ensure_dropbear_logging.
+[Service]
+StandardOutput=append:${XNET_DROPBEAR_LOG}
+StandardError=append:${XNET_DROPBEAR_LOG}
+EOF
+
+  cat > /etc/logrotate.d/xnet-dropbear <<EOF
+${XNET_DROPBEAR_LOG} {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    create 0644 root root
+}
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+
+  # A logging directive only takes effect on RESTART. Without this, a server
+  # upgraded in place keeps a dropbear that writes nowhere the panel looks, and
+  # every Dropbear account goes on reporting 0 online and 0 traffic while the
+  # unit file looks perfectly correct. Restarting is done ONLY when the drop-in
+  # was just created, so re-running the installer does not drop live tunnels
+  # every time.
+  if [ "$had_dropin" = "0" ] && systemctl is-active dropbear >/dev/null 2>&1; then
+    systemctl restart dropbear >/dev/null 2>&1 || true
+    ok "Dropbear restarted so it logs to ${XNET_DROPBEAR_LOG} (session attribution)."
+  fi
+}
+
+# XNET_RESTRICTED_SHELL is the login shell of every SSH account that is NOT a
+# Dropbear account, and it is the whole mechanism that keeps those accounts off
+# the Dropbear port.
+#
+# Each OpenSSH instance the panel runs is locked to one protocol group with
+# AllowGroups, so an "SSH WS" account cannot authenticate on the SSH TCP port.
+# Dropbear has no such directive. The pam_succeed_if rule below only works if
+# dropbear was BUILT with PAM, and Debian/Ubuntu build it against shadow
+# instead — so on these hosts the rule is inert and dropbear accepted ANY valid
+# Linux account. An "SSH TCP" account could therefore log in on port 446, where
+# its session is root-owned and invisible to per-account accounting.
+#
+# Dropbear's one unconditional per-user gate is /etc/shells: it rejects any
+# account whose login shell is not listed there ("has invalid shell, rejected").
+# So Dropbear accounts keep /bin/bash (always listed) and everyone else gets
+# this symlink, which is deliberately NOT listed. OpenSSH never reads
+# /etc/shells, and the symlink points at /bin/bash, so nothing else changes:
+# same sessions, same forwarding, same banner.
+XNET_RESTRICTED_SHELL="/usr/local/sbin/xnet-shell"
+
+ensure_dropbear_user_gate() {
+  mkdir -p "$(dirname "$XNET_RESTRICTED_SHELL")"
+  # A symlink, not a wrapper script: sshd execs the login shell with argv[0]
+  # prefixed by '-', and bash only treats itself as a LOGIN shell when it sees
+  # that. A script would lose it, and with it /etc/profile and the banner.
+  if [ ! -e "$XNET_RESTRICTED_SHELL" ] || [ "$(readlink -f "$XNET_RESTRICTED_SHELL" 2>/dev/null)" != "$(readlink -f /bin/bash 2>/dev/null)" ]; then
+    ln -sfn /bin/bash "$XNET_RESTRICTED_SHELL"
+  fi
+
+  # The gate is the ABSENCE of this path from /etc/shells. `chsh` and some
+  # packages append to that file, and a single stray line would silently reopen
+  # the Dropbear port to every account on the box, so it is removed on every run
+  # rather than only checked once.
+  if grep -qxF "$XNET_RESTRICTED_SHELL" /etc/shells 2>/dev/null; then
+    sed -i "\|^${XNET_RESTRICTED_SHELL}\$|d" /etc/shells
+    warn "Removed ${XNET_RESTRICTED_SHELL} from /etc/shells — listing it there lets every SSH account use the Dropbear port."
+  fi
+  # Dropbear needs /bin/bash listed or its OWN accounts cannot log in.
+  grep -qxF /bin/bash /etc/shells 2>/dev/null || echo /bin/bash >> /etc/shells
+
+  # Defence in depth: harmless when dropbear has no PAM, effective when it does.
+  if [ -f /etc/pam.d/dropbear ] && ! grep -q 'ssh-dropbear-users' /etc/pam.d/dropbear 2>/dev/null; then
+    sed -i '1a auth required pam_succeed_if.so user ingroup ssh-dropbear-users' /etc/pam.d/dropbear 2>/dev/null || true
+  fi
+  ok "Dropbear account gate ready (non-Dropbear accounts use ${XNET_RESTRICTED_SHELL})."
 }
 
 # ensure_dropbear_unit writes a clean dropbear.service running on the configured
@@ -751,9 +901,15 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=${bin} -F -E -p 444 -r /etc/dropbear/dropbear_rsa_host_key -r /etc/dropbear/dropbear_ed25519_host_key
+# -K 60: send keepalive probes so a client that disappeared without a clean
+# disconnect is detected and its session closed. Dropbear's default is 0 (off),
+# which leaves dead sessions occupying max_login slots indefinitely. The panel
+# rewrites this unit (with its own keepAlive value) on every SSH settings apply.
+ExecStart=${bin} -F -E -p 444 -K 60 -r /etc/dropbear/dropbear_rsa_host_key -r /etc/dropbear/dropbear_ed25519_host_key
 Restart=on-failure
 RestartSec=5
+StandardOutput=append:${XNET_DROPBEAR_LOG}
+StandardError=append:${XNET_DROPBEAR_LOG}
 
 [Install]
 WantedBy=multi-user.target
@@ -761,17 +917,15 @@ EOF
     systemctl daemon-reload >/dev/null 2>&1 || true
   fi
 
+  ensure_dropbear_logging
+
   # Ensure /bin/false and /usr/sbin/nologin are listed in /etc/shells so Dropbear
   # accepts login for SSH tunnel users (created with these shells by the panel).
   for sh in /bin/false /usr/sbin/nologin; do
     grep -qxF "$sh" /etc/shells 2>/dev/null || echo "$sh" >> /etc/shells
   done
 
-  # Restrict Dropbear logins to the ssh-dropbear-users group when the
-  # PAM hook exists, so only Dropbear accounts can use it.
-  if [ -f /etc/pam.d/dropbear ] && ! grep -q 'ssh-dropbear-users' /etc/pam.d/dropbear 2>/dev/null; then
-    sed -i '1a auth required pam_succeed_if.so user ingroup ssh-dropbear-users' /etc/pam.d/dropbear 2>/dev/null || true
-  fi
+  ensure_dropbear_user_gate
   systemctl enable --now dropbear >/dev/null 2>&1 || true
   ok "Dropbear unit ready and started."
 }
@@ -1084,6 +1238,12 @@ UsePAM yes
 AllowTcpForwarding yes
 PermitTunnel yes
 GatewayPorts clientspecified
+# Reap sessions whose client vanished without disconnecting cleanly. Without
+# these, a dropped mobile connection leaves a half-open session alive forever,
+# which keeps showing the user as online and consumes a max_login slot. The
+# panel overwrites both values from its SSH settings on every apply.
+ClientAliveInterval 60
+ClientAliveCountMax 3
 Subsystem sftp ${sftp}
 EOF
     cat > "/etc/systemd/system/sshd-${svc}.service" <<EOF
@@ -1152,6 +1312,14 @@ deploy_files() {
     ok "Service user '$SERVICE_USER' created."
   fi
 
+  # Journal read access. The panel reads SSH authentication lines to attribute
+  # Dropbear tunnel-only sessions to an account (nothing else can — see
+  # ensure_dropbear_logging). It prefers the plain log file, but on a host where
+  # that is unavailable the journal is the fallback, and a non-root user sees
+  # only its own journal unless it is in this group. Idempotent; the group is
+  # absent on non-systemd hosts, where the failure is harmless.
+  usermod -aG systemd-journal "$SERVICE_USER" >/dev/null 2>&1 || true
+
   # Create the SSH protocol groups up-front (idempotent) so they exist on EVERY
   # node — panel or agent — before any account is provisioned. Without these,
   # `useradd -G ssh-tcp-users` fails with "group does not exist" on a node that
@@ -1200,11 +1368,33 @@ deploy_files() {
   ok "xnet-ssh-apply helper installed."
 
   # --- Optional helper scripts (if present) ---
-  for script in xnet-install-sshd.sh xnet-cert-install.sh healthcheck.sh; do
+  # xnet-fix-banner / xnet-diag-* are installed alongside the rest so they can be
+  # run straight from /opt/xnet on a server that no longer has the source tree.
+  # xnet-fix-banner resolves xnet-ssh-info from its own directory, which is
+  # exactly where install.sh puts it.
+  # xnet-fix-sudoers is in this list because the sudoers failure path below
+  # tells the operator to run it. It was never copied, so that instruction sent
+  # them looking for a file that is not on the machine.
+  for script in xnet-install-sshd.sh xnet-cert-install.sh healthcheck.sh \
+                xnet-fix-banner.sh xnet-diag-banner.sh xnet-diag-traffic.sh \
+                xnet-fix-sudoers.sh; do
     if [ -f "$SCRIPT_DIR/$script" ]; then
       install -m 0755 "$SCRIPT_DIR/$script" "${INSTALL_DIR}/${script%.sh}"
     fi
   done
+
+  # --- xnet-ssh-info (per-account stats: banner generator + Dropbear lookup) ---
+  # Shipped as a real file rather than an inline heredoc so there is exactly one
+  # copy to keep correct. xnet-ssh-apply refuses to configure banners without it.
+  if [ -f "$SCRIPT_DIR/xnet-ssh-info" ]; then
+    install -m 0755 "$SCRIPT_DIR/xnet-ssh-info" "${INSTALL_DIR}/xnet-ssh-info"
+    # Strip any CR so a file edited on Windows does not break the shebang.
+    sed -i 's/\r$//' "${INSTALL_DIR}/xnet-ssh-info" 2>/dev/null || true
+    chmod 0755 "${INSTALL_DIR}/xnet-ssh-info"
+    ok "xnet-ssh-info helper installed."
+  else
+    warn "xnet-ssh-info not found next to install.sh — SSH account stats will not work."
+  fi
 
   # --- Management CLI (xnet) ---
   # Installed to /opt/xnet/xnet-cli and symlinked as /usr/local/bin/xnet so the
@@ -1221,6 +1411,16 @@ deploy_files() {
   chown -R "${SERVICE_USER}:${SERVICE_USER}" /var/lib/xnet 2>/dev/null || true
   chmod 0755 /var/lib/xnet /var/lib/xnet/acme 2>/dev/null || true
   ok "File permissions set."
+  # xnet-ssh-info / xnet-ssh-greet are reachable through sudo from every SSH
+  # account, so they must stay root-owned — the unprivileged panel user must not
+  # be able to rewrite a script that any account can then run as root.
+  # (xnet-fc / xnet-fc-pam are the retired v8 hooks; xnet-ssh-apply deletes them.)
+  for helper in xnet-ssh-info xnet-ssh-greet; do
+    if [ -f "${INSTALL_DIR}/${helper}" ]; then
+      chown root:root "${INSTALL_DIR}/${helper}" 2>/dev/null || true
+      chmod 0755 "${INSTALL_DIR}/${helper}"
+    fi
+  done
 
   # --- setcap AFTER chown (chown strips extended attributes including caps) ---
   if ! command -v setcap >/dev/null 2>&1; then
@@ -1257,6 +1457,27 @@ xnet ALL=(root) NOPASSWD: /usr/sbin/useradd, /usr/sbin/usermod, /usr/sbin/userde
 xnet ALL=(root) NOPASSWD: /sbin/useradd, /sbin/usermod, /sbin/userdel, /sbin/chpasswd
 xnet ALL=(root) NOPASSWD: /usr/bin/chpasswd, /usr/bin/pkill, /bin/pkill, /usr/bin/kill, /bin/kill
 xnet ALL=(root) NOPASSWD: /usr/sbin/groupadd, /sbin/groupadd
+# gpasswd: removes a user from a protocol group when its SSH method changes, so
+# the account loses access to the protocol it is no longer assigned to (each
+# sshd instance is gated by AllowGroups on exactly one of these groups).
+xnet ALL=(root) NOPASSWD: /usr/bin/gpasswd, /bin/gpasswd, /usr/sbin/gpasswd
+# passwd: read-only account status (`passwd -S <user>`) is how the panel checks
+# that a provisioned account can ACTUALLY authenticate — that its hash is
+# present and not locked — instead of trusting that provisioning reported
+# success. Password writes still go through chpasswd.
+xnet ALL=(root) NOPASSWD: /usr/bin/passwd, /bin/passwd
+# Live connection inspection: `ss -tnp` reports the PID owning each established
+# socket, which is how the panel resolves the source IP of a connected SSH user.
+# Needed because /proc/<pid>/fd of an SSH account's process is root-only, so an
+# unprivileged panel cannot read the peer address any other way.
+xnet ALL=(root) NOPASSWD: /usr/sbin/ss, /sbin/ss, /usr/bin/ss, /bin/ss
+# Auth-log reading: a Dropbear tunnel-only session never runs a process as the
+# account, so its authentication log line is the ONLY record of which account
+# owns the connection — without it such accounts show 0 online and 0 traffic.
+# The panel prefers /var/log/xnet/dropbear.log (world-readable, written by the
+# unit) and falls back to journalctl, which the service user cannot read on its
+# own. Read-only; journalctl cannot modify anything.
+xnet ALL=(root) NOPASSWD: /usr/bin/journalctl, /bin/journalctl
 # Firewall
 xnet ALL=(root) NOPASSWD: /usr/sbin/nft, /sbin/nft
 xnet ALL=(root) NOPASSWD: /usr/sbin/ufw, /usr/bin/ufw, /usr/bin/firewall-cmd, /bin/firewall-cmd
@@ -1265,6 +1486,19 @@ xnet ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload, /bin/systemctl daemo
 # Privileged helpers (trailing-arg wildcard is permitted by sudo)
 xnet ALL=(root) NOPASSWD: /opt/xnet/xnet-ssh-apply, /opt/xnet/xnet-ssh-apply *
 xnet ALL=(root) NOPASSWD: /opt/xnet/xnet-cert-install, /opt/xnet/xnet-cert-install *
+# SSH user account info: any authenticated SSH user may run xnet-ssh-info to
+# see their own account stats (expiry, traffic, max-login). The script prints
+# only the row matching the supplied username and never modifies anything.
+# The per-session hooks (/etc/ssh/sshrc, /etc/profile.d/xnet-ssh-info.sh) run
+# unprivileged and depend on this; without it a session shows the banner text
+# and no account details at all. xnet-ssh-apply re-installs the same rule as
+# /etc/sudoers.d/xnet-ssh-info so upgraded servers are covered too.
+# The Defaults !requiretty directive is not portable and causes visudo to
+# reject the generated fragment on some distributions. Omit it so the sudoers
+# fragment is portable across Debian/Ubuntu and RHEL-family hosts. If a host
+# requires a !requiretty rule, operators should add it manually into a safe,
+# audited sudoers fragment via visudo.
+ALL ALL=(root) NOPASSWD: /opt/xnet/xnet-ssh-info, /opt/xnet/xnet-ssh-info *
 # TLS certificate management (issuance needs args: certonly --webroot/--standalone ...)
 xnet ALL=(root) NOPASSWD: /usr/bin/certbot, /usr/bin/certbot *, /bin/certbot, /bin/certbot *
 # Panel self-restart via a transient unit (separate cgroup) so the restart
@@ -1288,15 +1522,58 @@ EOF
   chmod 440 "$tmp"
 
   # Validate BEFORE activating; an invalid file would break sudo for the panel.
-  if visudo -cf "$tmp" >/dev/null 2>&1; then
+  #
+  # The validation output is REPORTED, not discarded. This used to run with
+  # `>/dev/null 2>&1` and fail with a single warn line, so the one message that
+  # explained the failure — visudo naming the offending line — was thrown away.
+  # When no /etc/sudoers.d/xnet existed yet, "left existing rules unchanged" also
+  # meant "left NO rules at all", and the panel came up unable to run a single
+  # privileged command: no SSH user creation, no service restart, no port change.
+  # That looked like a dozen unrelated runtime failures instead of one install
+  # step that did not happen.
+  local visudo_out
+  if visudo_out="$(visudo -cf "$tmp" 2>&1)"; then
     mv -f "$tmp" /etc/sudoers.d/xnet
     rm -f /etc/sudoers.d/xnet-ssh-apply 2>/dev/null || true
     ok "Sudoers configured and validated (visudo OK)."
+
+    # Also provision a small helper fragment (/etc/sudoers.d/xnet-apply) used
+    # by previous installations and convenience scripts. Validate it separately
+    # with visudo to prevent accidental sudo lockout.
+    cat > /etc/sudoers.d/xnet-apply <<'EOS'
+# Helper fragment allowing xnet to run the apply helper and a few passwd helpers
+xnet ALL=(root) NOPASSWD: /opt/xnet/xnet-ssh-apply, /opt/xnet/xnet-ssh-apply *
+xnet ALL=(root) NOPASSWD: /usr/bin/gpasswd, /bin/gpasswd, /usr/sbin/gpasswd
+xnet ALL=(root) NOPASSWD: /usr/bin/passwd, /bin/passwd
+EOS
+    chmod 0440 /etc/sudoers.d/xnet-apply || true
+    if ! visudo -c -f /etc/sudoers.d/xnet-apply >/dev/null 2>&1; then
+      warn "Created /etc/sudoers.d/xnet-apply but visudo rejected it — removing to be safe."
+      rm -f /etc/sudoers.d/xnet-apply || true
+    else
+      ok "/etc/sudoers.d/xnet-apply installed and validated."
+    fi
   else
-    rm -f "$tmp" 2>/dev/null || true
-    warn "Generated sudoers failed visudo validation; left existing rules unchanged."
+    # Keep the rejected file for inspection under a name sudo ignores (the dot
+    # prefix), so the operator can see exactly what was generated.
+    mv -f "$tmp" /etc/sudoers.d/.xnet.rejected 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+    err_line "Generated sudoers FAILED visudo validation:"
+    printf '%s\n' "$visudo_out" | sed 's/^/    /'
+    err_line "The rejected file was kept at /etc/sudoers.d/.xnet.rejected for inspection."
+    if [ -f /etc/sudoers.d/xnet ]; then
+      warn "Existing /etc/sudoers.d/xnet left in place — the panel keeps its previous privileges."
+    else
+      # Nothing to fall back on. Say plainly what will not work, because every
+      # later symptom traces back here.
+      err_line "There is NO /etc/sudoers.d/xnet on this host, so the panel has NO privileges."
+      err_line "SSH account creation, service restarts and port changes will all fail with"
+      err_line "\"sudo: ... not allowed\" until this is fixed. Run: xnet fix sudoers"
+    fi
   fi
 }
+
+# err_line prints an error-styled line without aborting, for multi-line reports.
+err_line() { echo -e "  ${C_RED}✗${C_RESET} $*" >&2; }
 
 # ----- env file ---------------------------------------------------------------
 create_env() {
@@ -1681,6 +1958,7 @@ main() {
   echo
 
   install_deps
+  persist_tcp_early_demux
   install_singbox
   install_ssh_subsystems
 

@@ -13,7 +13,8 @@
 #
 #  Exit codes: 0 = success, 1 = usage/input error, 2 = partial apply error
 # ============================================================
-# XNET_SSH_APPLY_VERSION=6   (v6: remove legacy stunnel xnet-ssh.conf that hardcoded connect=:22; TLS forwards only to sshd_tls:2223)
+# XNET_SSH_APPLY_VERSION=9   (v9: the per-account stats block moves into the SSH banner itself — per-account banner files selected by `Match User`, because session-channel output never reaches SSH-tunnel clients)
+# XNET_SSH_APPLY_VERSION=8   (v8: apply the panel's banner setting — write /etc/ssh/xnet-banner.txt + set Banner directive in all sshd configs + Dropbear -b flag; also install per-user info profile.d script)
 set -uo pipefail
 
 SETTINGS_FILE="${1:-/opt/xnet/ssh-settings.json}"
@@ -152,10 +153,406 @@ update_sshd_port() {
   local config_file="$1" new_port="$2"
   [ -f "$config_file" ] || return 0
   if grep -q "^Port " "$config_file"; then
-    sed -i "s/^Port [0-9]\+/Port $new_port/" "$config_file"
+    sed -i "s/^Port [0-9]*/Port $new_port/" "$config_file"
   else
     sed -i "1i Port $new_port" "$config_file"
   fi
+}
+
+# --- Helper: set (or replace) a single sshd directive ------------------------
+# Replaces the directive whether it is currently active or commented out, and
+# appends it when absent. Case-insensitive, because sshd_config directives are.
+# Never touches AllowGroups (see the file header contract).
+# Uses a | delimiter in sed so values containing / (e.g. file paths) are safe.
+set_sshd_directive() {
+  local config_file="$1" directive="$2" value="$3"
+  [ -f "$config_file" ] || return 0
+  if grep -qiE "^[#[:space:]]*${directive}[[:space:]]" "$config_file"; then
+    # Use | as sed delimiter — safe even when $value contains / characters.
+    sed -i -E "s|^[#[:space:]]*${directive}[[:space:]].*|${directive} ${value}|I" "$config_file"
+  else
+    echo "${directive} ${value}" >> "$config_file"
+  fi
+}
+
+# --- Banner: the admin's message + each account's stats block ----------------
+#
+# Everything the client sees is delivered PRE-AUTH, as the SSH banner. That is
+# deliberate: the banner is the only thing every SSH client displays. Tunnel apps
+# (HTTP Injector, NPV Tunnel, SocksIP) never open a session channel and never
+# show session output, so a ForceCommand wrapper, /etc/ssh/sshrc or a profile.d
+# script is invisible to them no matter how correctly it is wired — which is why
+# earlier versions showed the admin's text but never the account details.
+#
+#   OpenSSH (tcp + ws + tls + dns):
+#     Banner /etc/ssh/xnet-banner.txt                 <- global, plain text
+#     Match User <acct> / Banner /etc/ssh/xnet-banners/<acct>.txt
+#                                                     <- text + that account's block
+#   Dropbear:
+#     -b /etc/ssh/xnet-banner.txt                     <- text only; Dropbear has
+#     /etc/profile.d/xnet-ssh-info.sh                    no per-user banner, so
+#                                                        its block comes from the
+#                                                        login shell hook
+#
+# sshd evaluates Match before sending the banner (the username arrives with the
+# first userauth request), and it re-reads the banner file on every connection —
+# so refreshing the numbers costs nothing and needs no reload. xnet-ssh-info
+# --write-banners does the regeneration; a systemd timer keeps traffic current.
+XNET_BANNER_FILE="/etc/ssh/xnet-banner.txt"
+XNET_BANNER_DIR="/etc/ssh/xnet-banners"
+XNET_PROFILE_SCRIPT="/etc/profile.d/xnet-ssh-info.sh"
+XNET_USER_INFO_SCRIPT="/opt/xnet/xnet-ssh-info"
+XNET_GREET_SCRIPT="/opt/xnet/xnet-ssh-greet"
+XNET_SUDOERS_FILE="/etc/sudoers.d/xnet-ssh-info"
+XNET_REFRESH_UNIT="/etc/systemd/system/xnet-ssh-banners.service"
+XNET_REFRESH_TIMER="/etc/systemd/system/xnet-ssh-banners.timer"
+# Hooks from earlier versions, removed on every apply (see remove_legacy_hooks).
+XNET_SSHRC="/etc/ssh/sshrc"
+XNET_SSHRC_MARK="xnet-managed-sshrc"
+XNET_FC_SCRIPT="/opt/xnet/xnet-fc"
+XNET_FC_PAM_SCRIPT="/opt/xnet/xnet-fc-pam"
+
+apply_ssh_banner() {
+  local banner_text
+  banner_text="$(jget '.openssh.banner' '')"
+
+  # Retire the session-hook mechanisms on every run, banner on or off, so an
+  # upgraded server cannot end up printing the block twice (or running a hook
+  # that never worked).
+  remove_legacy_hooks
+
+  # Trim leading/trailing blank lines so an accidental Enter before the first
+  # word does not push the message down.
+  banner_text="$(printf '%s' "$banner_text" | awk 'NF{found=1} found{print}' | awk '{lines[NR]=$0} END{for(i=NR;i>=1;i--){if(lines[i]~/[^[:space:]]/){last=i;break}} for(i=1;i<=last;i++){print lines[i]}}')"
+
+  if [ -z "$banner_text" ] || [ "$banner_text" = "null" ]; then
+    rm -f "$XNET_BANNER_FILE" 2>/dev/null || true
+    local cfg
+    for cfg in /etc/ssh/sshd_config /etc/ssh/sshd_config_ws /etc/ssh/sshd_config_tls /etc/ssh/sshd_config_dns; do
+      [ -f "$cfg" ] || continue
+      sed -i -E '\|^[#[:space:]]*Banner[[:space:]]|d' "$cfg"
+    done
+    # Drops the per-account files and the managed Match sections; it keys off the
+    # now-missing banner file, so it must run after the rm above.
+    regenerate_account_banners
+    rm -f "$XNET_PROFILE_SCRIPT" "$XNET_SUDOERS_FILE" 2>/dev/null || true
+    remove_refresh_timer
+    log "Banner: disabled — text, per-account banners, hooks and sudoers rule removed"
+    return 0
+  fi
+
+  printf '%s\n' "$banner_text" > "$XNET_BANNER_FILE"
+  chmod 644 "$XNET_BANNER_FILE"
+
+  install_user_info_scripts
+  install_user_info_sudoers
+
+  # Global Banner: what root and any non-account login sees. Per-account Match
+  # blocks override it for the accounts themselves.
+  local cfg
+  for cfg in /etc/ssh/sshd_config /etc/ssh/sshd_config_ws /etc/ssh/sshd_config_tls /etc/ssh/sshd_config_dns; do
+    [ -f "$cfg" ] || continue
+    set_sshd_directive "$cfg" "Banner" "$XNET_BANNER_FILE"
+  done
+  log "Banner: written to $XNET_BANNER_FILE and set in all sshd configs"
+
+  install_refresh_timer
+  log "Banner + per-account stats configured"
+}
+
+# regenerate_account_banners rebuilds /etc/ssh/xnet-banners/* and the managed
+# Match sections. It is also what the systemd timer calls.
+#
+# Called LAST in main() as well: the Match section has to sit at the very end of
+# each sshd config, because every global directive after a Match belongs to that
+# block. Any function that appends a directive must therefore run before this.
+regenerate_account_banners() {
+  ensure_sshd_unit_reload
+  if [ ! -x "$XNET_USER_INFO_SCRIPT" ]; then
+    log "warning: $XNET_USER_INFO_SCRIPT missing — per-account banners not generated"
+    return 0
+  fi
+  # The helper reports which sshd configs received the Match section. Relay every
+  # line: each config backs a different transport, so a config it could not
+  # update means that protocol silently falls back to the plain banner text —
+  # which is how the block ended up working on SSH TCP alone.
+  local out rc
+  out="$("$XNET_USER_INFO_SCRIPT" --write-banners 2>&1)"; rc=$?
+  [ -n "$out" ] && printf '%s\n' "$out" | while IFS= read -r line; do log "$line"; done
+  if [ "$rc" -ne 0 ]; then
+    log "warning: some sshd configs did not receive the per-account banner section"
+    HAD_ERROR=1
+  fi
+  local n=0
+  [ -d "$XNET_BANNER_DIR" ] && n="$(find "$XNET_BANNER_DIR" -name '*.txt' 2>/dev/null | wc -l)"
+  log "Per-account banners: ${n} account(s) in $XNET_BANNER_DIR"
+}
+
+# ensure_sshd_unit_reload adds ExecReload to the WS/TLS/SlowDNS sshd units when
+# it is missing.
+#
+# Those units were generated without one, so `systemctl reload sshd-ws` fails
+# with "Job type reload is not applicable" — and sshd only parses its config at
+# startup, handing the parsed copy to each connection. The result: a Match block
+# written into sshd_config_ws was never seen by the running daemon. The distro's
+# own ssh unit does have ExecReload, which is exactly why the per-account banner
+# worked on SSH TCP and on no other protocol.
+#
+# xnet-ssh-info also falls back to SIGHUP, so this is belt-and-braces — but it
+# repairs the unit permanently instead of working around it on every run.
+ensure_sshd_unit_reload() {
+  local svc unit changed=0
+  for svc in ws tls dns; do
+    unit="/etc/systemd/system/sshd-${svc}.service"
+    [ -f "$unit" ] || continue
+    grep -q '^ExecReload=' "$unit" && continue
+    # SIGHUP makes sshd re-exec and re-read its config while leaving established
+    # sessions alone, so live tunnels are not dropped.
+    sed -i '/^ExecStart=/a ExecReload=/bin/kill -HUP $MAINPID' "$unit"
+    log "sshd-${svc}: added ExecReload (config changes could not reach it before)"
+    changed=1
+  done
+  [ "$changed" = "1" ] && systemctl daemon-reload >/dev/null 2>&1
+  return 0
+}
+
+# install_user_info_scripts installs the Dropbear-side login hook. The stats
+# helper itself (/opt/xnet/xnet-ssh-info) ships with the panel and is installed
+# by install.sh — this only checks that it is present and current, because a
+# server that updated this helper alone would otherwise silently keep a copy
+# that has no --write-banners mode.
+install_user_info_scripts() {
+  if [ ! -x "$XNET_USER_INFO_SCRIPT" ]; then
+    log "ERROR: $XNET_USER_INFO_SCRIPT is missing — account stats cannot be generated."
+    log "       Re-run install.sh (or copy install/xnet-ssh-info to /opt/xnet/) and retry."
+    HAD_ERROR=1
+    return 0
+  fi
+  if ! grep -q 'XNET_SSH_INFO_VERSION=2' "$XNET_USER_INFO_SCRIPT"; then
+    log "ERROR: $XNET_USER_INFO_SCRIPT is OUTDATED (needs XNET_SSH_INFO_VERSION=2)."
+    log "       Copy install/xnet-ssh-info to /opt/xnet/xnet-ssh-info and retry."
+    HAD_ERROR=1
+    return 0
+  fi
+  # Reachable through sudo from every SSH account, so it must stay root-owned.
+  chown root:root "$XNET_USER_INFO_SCRIPT" 2>/dev/null || true
+  chmod 755 "$XNET_USER_INFO_SCRIPT"
+
+  # xnet-ssh-greet — the unprivileged wrapper the Dropbear hook calls.
+  cat > "$XNET_GREET_SCRIPT" <<'SHEOF'
+#!/bin/sh
+# xnet-ssh-greet — print the current SSH account's stats block on stdout.
+# Callers redirect to stderr; see /etc/profile.d/xnet-ssh-info.sh.
+INFO=/opt/xnet/xnet-ssh-info
+
+# Dropbear sets LOGNAME for every session; $USER is not set on all distros, and
+# `id -un` is the last resort.
+_u="${1:-}"
+[ -n "$_u" ] || _u="${LOGNAME:-${USER:-$(id -un 2>/dev/null)}}"
+[ -n "$_u" ] || exit 0
+[ "$_u" = "root" ] && exit 0
+
+if [ "$(id -u)" = "0" ]; then
+  [ -x "$INFO" ] || exit 0
+  "$INFO" "$_u" stdout 2>/dev/null
+else
+  # Deliberately NOT gated on an -x test here: that test would run as the SSH
+  # account, which may not be able to stat /opt/xnet at all, and failing it would
+  # skip the sudo call that would have succeeded. Let sudo be the one to decide.
+  #
+  # Needs /etc/sudoers.d/xnet-ssh-info. sudo's own diagnostics are dropped so a
+  # misconfiguration cannot corrupt a tunnel's stream; the reason goes to syslog.
+  sudo -n "$INFO" "$_u" stdout 2>/dev/null || {
+    command -v logger >/dev/null 2>&1 && logger -t xnet-ssh-greet -p authpriv.warning \
+      "sudo -n $INFO failed for $_u — check /etc/sudoers.d/xnet-ssh-info"
+  }
+fi
+exit 0
+SHEOF
+  chown root:root "$XNET_GREET_SCRIPT" 2>/dev/null || true
+  chmod 755 "$XNET_GREET_SCRIPT"
+
+  # profile.d — Dropbear's stats hook. OpenSSH does not need one: its accounts
+  # get the block in the banner itself.
+  cat > "$XNET_PROFILE_SCRIPT" <<'SHEOF'
+# xnet-ssh-info.sh — X-Net panel: per-account stats block on Dropbear logins.
+#
+# This file is SOURCED by /etc/profile, so it must never call `exit` — that
+# would terminate the user's login shell. (It previously ran `exit 0` when
+# SSH_CONNECTION was unset, which killed every console login and `su -`.)
+#
+# OpenSSH accounts receive their block in the pre-auth banner, so this hook is
+# scoped to Dropbear by checking which daemon started the shell. Without that
+# check an OpenSSH login would print the block twice.
+if [ -n "$SSH_CONNECTION" ] && [ -x /opt/xnet/xnet-ssh-greet ]; then
+	_xnet_parent=""
+	[ -r "/proc/$PPID/comm" ] && _xnet_parent="$(cat "/proc/$PPID/comm" 2>/dev/null)"
+	case "$_xnet_parent" in
+		dropbear*) /opt/xnet/xnet-ssh-greet >&2 ;;
+	esac
+	unset _xnet_parent
+fi
+SHEOF
+  chmod 644 "$XNET_PROFILE_SCRIPT"
+
+  harden_user_info_paths
+  log "User-info scripts installed: xnet-ssh-greet, profile.d (Dropbear hook)"
+}
+
+# harden_user_info_paths makes the helpers reachable by an SSH account while
+# keeping the panel's data out of reach.
+#
+# The Dropbear hook runs as the logging-in user, so /opt/xnet has to be
+# traversable or even `[ -x /opt/xnet/xnet-ssh-greet ]` fails and the session
+# silently prints nothing. Nothing in the installer ever set that mode — it
+# inherited root's umask, so on a hardened host it can be 0750 and the hook dies
+# quietly. Making the directory traversable would expose /opt/xnet/data/xnet.db,
+# which sqlite creates 0644 and which holds admin password hashes and every
+# client's UUID, so the data directory is locked down in the same pass.
+harden_user_info_paths() {
+  chmod o+rx /opt/xnet 2>/dev/null || true
+  if [ -d /opt/xnet/data ]; then
+    chmod 0750 /opt/xnet/data 2>/dev/null || true
+    find /opt/xnet/data -maxdepth 1 -type f -name 'xnet.db*' -exec chmod 0640 {} + 2>/dev/null || true
+  fi
+  # The .env holds the JWT secret and node keys — never group- or world-readable.
+  [ -f /opt/xnet/.env ] && chmod 0600 /opt/xnet/.env 2>/dev/null || true
+  return 0
+}
+
+# install_user_info_sudoers lets the Dropbear hook read the panel DB. OpenSSH no
+# longer needs it (sshd reads the banner file itself, as root), but Dropbear's
+# hook runs as the account and has no other way in.
+install_user_info_sudoers() {
+  local tmp="/etc/sudoers.d/.xnet-ssh-info.tmp"   # dotted name => ignored by sudo while staging
+  cat > "$tmp" <<'EOF'
+# ---- X-Net Panel — SSH account stats ----
+# /etc/profile.d/xnet-ssh-info.sh runs as the logging-in user on Dropbear
+# sessions and needs this to read the panel DB. xnet-ssh-info is read-only in
+# this mode: it prints the ssh_accounts row for the username it is handed.
+Defaults!/opt/xnet/xnet-ssh-info !requiretty
+ALL ALL=(root) NOPASSWD: /opt/xnet/xnet-ssh-info, /opt/xnet/xnet-ssh-info *
+EOF
+  chmod 0440 "$tmp"
+  # Validate before activating: an invalid file in /etc/sudoers.d breaks sudo for
+  # every user, including the panel's own privileged helpers.
+  if ! command -v visudo >/dev/null 2>&1 || visudo -cf "$tmp" >/dev/null 2>&1; then
+    mv -f "$tmp" "$XNET_SUDOERS_FILE"
+    log "sudoers: $XNET_SUDOERS_FILE installed"
+  else
+    rm -f "$tmp" 2>/dev/null || true
+    log "sudoers: WARNING — validation failed, Dropbear stats will not be shown"
+  fi
+}
+
+# install_refresh_timer keeps the numbers in each account's banner current.
+# Content refreshes never touch sshd_config and never reload anything, so this
+# can run often; only adding or removing an account rewrites the Match sections.
+install_refresh_timer() {
+  cat > "$XNET_REFRESH_UNIT" <<'UNIT'
+[Unit]
+Description=X-Net: refresh per-account SSH banners
+[Service]
+Type=oneshot
+ExecStart=/opt/xnet/xnet-ssh-info --write-banners
+UNIT
+  cat > "$XNET_REFRESH_TIMER" <<'UNIT'
+[Unit]
+Description=X-Net: refresh per-account SSH banners every 2 minutes
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+AccuracySec=15s
+[Install]
+WantedBy=timers.target
+UNIT
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now xnet-ssh-banners.timer >/dev/null 2>&1 \
+    && log "Refresh timer: xnet-ssh-banners.timer enabled (every 2 min)" \
+    || log "warning: could not enable xnet-ssh-banners.timer — traffic figures will only update on apply"
+}
+
+remove_refresh_timer() {
+  systemctl disable --now xnet-ssh-banners.timer >/dev/null 2>&1 || true
+  rm -f "$XNET_REFRESH_UNIT" "$XNET_REFRESH_TIMER" 2>/dev/null || true
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+# remove_legacy_hooks retires every earlier stats mechanism: the xnet-fc
+# ForceCommand wrapper, the Dropbear pam_exec hook, and the /etc/ssh/sshrc hook.
+# All are removed unconditionally so an upgraded server never runs two at once.
+remove_legacy_hooks() {
+  local cfg
+  # Restore the plain /bin/cat these instances are configured with. Deleting the
+  # line outright would leave them with no ForceCommand at all, handing
+  # tunnel-only accounts a real shell.
+  for cfg in /etc/ssh/sshd_config_ws /etc/ssh/sshd_config_tls /etc/ssh/sshd_config_dns; do
+    [ -f "$cfg" ] || continue
+    grep -qF "xnet-fc" "$cfg" || continue
+    set_sshd_directive "$cfg" "ForceCommand" "/bin/cat"
+    log "ForceCommand: restored /bin/cat in $cfg (was xnet-fc)"
+  done
+  if [ -f /etc/pam.d/dropbear ] && grep -qF "xnet-fc-pam" /etc/pam.d/dropbear; then
+    sed -i '/xnet-fc-pam/d' /etc/pam.d/dropbear
+    log "Dropbear PAM: removed the xnet-fc-pam hook (pam_exec discarded its output)"
+  fi
+  rm -f "$XNET_FC_SCRIPT" "$XNET_FC_PAM_SCRIPT" 2>/dev/null || true
+  # sshrc reached OpenSSH session channels, which tunnel apps never display.
+  # Superseded by the per-account banner; leaving it would double-print for
+  # anyone using a terminal client.
+  if [ -f "$XNET_SSHRC" ]; then
+    if grep -qF "$XNET_SSHRC_MARK" "$XNET_SSHRC"; then
+      rm -f "$XNET_SSHRC"
+      log "sshrc: removed $XNET_SSHRC (superseded by per-account banners)"
+    elif grep -qF "xnet-ssh-greet" "$XNET_SSHRC"; then
+      sed -i '/xnet-ssh-greet/d;/# xnet: per-account stats on login/d' "$XNET_SSHRC"
+      log "sshrc: removed the xnet hook from the existing $XNET_SSHRC"
+    fi
+  fi
+}
+# --- Keepalive: reap sessions whose client vanished --------------------------
+# Without this, a client that disappears without a clean disconnect (mobile
+# network drop, app force-closed) leaves a half-open connection: the daemon
+# never notices, the per-session process stays alive, and the account keeps
+# showing as online — permanently consuming one of its max_login slots.
+#
+# ClientAliveInterval makes sshd probe the peer; after ClientAliveCountMax
+# unanswered probes the session is dropped. It does NOT disconnect a live but
+# idle tunnel (the peer answers the probe), which is why this is safe for VPN
+# use where ClientAliveCountMax*Interval of true silence means the peer is gone.
+#
+# Applied to the main sshd AND to the three internal instances that back the
+# WS / TLS / SlowDNS transports — those carry the same defect, so fixing only
+# the main config would leave four of the six protocols still leaking sessions.
+apply_ssh_keepalive() {
+  local interval count
+  interval="$(jget '.openssh.keepAlive' '60')"
+  # 0 or a non-numeric value means "disabled": clear the probes rather than
+  # writing a broken directive that would stop sshd from starting.
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=60
+  count=3
+  if [ "$interval" -le 0 ]; then
+    interval=0
+    count=0
+  fi
+
+  local cfg
+  for cfg in /etc/ssh/sshd_config /etc/ssh/sshd_config_ws /etc/ssh/sshd_config_tls /etc/ssh/sshd_config_dns; do
+    [ -f "$cfg" ] || continue
+    set_sshd_directive "$cfg" "ClientAliveInterval" "$interval"
+    set_sshd_directive "$cfg" "ClientAliveCountMax" "$count"
+  done
+  log "Keepalive: ClientAliveInterval=${interval} ClientAliveCountMax=${count} (main + ws/tls/dns sshd)"
+}
+
+# dropbear_keepalive_flag echoes the "-K <secs>" argument for Dropbear, or an
+# empty string when keepalive is disabled. Dropbear's default is 0 (off), which
+# is why dead Dropbear sessions previously lingered indefinitely.
+dropbear_keepalive_flag() {
+  local interval
+  interval="$(jget '.openssh.keepAlive' '60')"
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=60
+  [ "$interval" -gt 0 ] && echo "-K ${interval}"
 }
 
 # --- OpenSSH (main sshd on port 22) -----------------------------------------
@@ -407,12 +804,16 @@ apply_dropbear() {
   # This is critical: many systems ignore /etc/default/dropbear and only use
   # the -p flag in the ExecStart line of the service file.
   local bin; bin="$(command -v dropbear || echo /usr/sbin/dropbear)"
+  local ka; ka="$(dropbear_keepalive_flag)"
+  # Banner flag: -b <file> when a banner file exists
+  local banner_flag=""
+  [ -f "$XNET_BANNER_FILE" ] && banner_flag="-b ${XNET_BANNER_FILE}"
   cat > /etc/systemd/system/dropbear.service <<UNIT
 [Unit]
 Description=Dropbear SSH server (xnet-managed)
 After=network.target
 [Service]
-ExecStart=${bin} -F -E -p ${port}
+ExecStart=${bin} -F -E -p ${port} ${ka} ${banner_flag}
 Restart=on-failure
 [Install]
 WantedBy=multi-user.target
@@ -453,12 +854,24 @@ UNIT
 
 # --- Main --------------------------------------------------------------------
 main() {
+  # FIRST: keepalive and banner both touch every sshd config file. They must
+  # run before the per-transport functions below, because those are what restart
+  # the units — writing the directives afterwards would leave them unapplied
+  # until the next unrelated restart.
+  apply_ssh_keepalive
+  apply_ssh_banner
   apply_openssh
   apply_ws_sshd
   apply_tls
   apply_slowdns
   apply_dropbear
   apply_udpgw
+  # LAST, and it must stay last. The per-account `Match User` blocks live at the
+  # end of each sshd config, and every global directive that follows a Match
+  # belongs to that block — so anything above that appends a directive has to run
+  # first. Regenerating here strips and re-appends the section, which also lifts
+  # it back to the end if an earlier step appended something after it.
+  regenerate_account_banners
   log "apply complete"
 }
 

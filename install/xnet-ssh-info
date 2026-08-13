@@ -1,0 +1,579 @@
+#!/usr/bin/env python3
+# XNET_SSH_INFO_VERSION=2
+#
+# xnet-ssh-info — SSH account stats for the X-Net panel. Runs as root.
+#
+# Two modes:
+#
+#   xnet-ssh-info <username> [stdout|stderr]
+#       Print one account's stats block. Used by the Dropbear login hook.
+#
+#   xnet-ssh-info --write-banners
+#       Regenerate /etc/ssh/xnet-banners/<user>.txt for every account and keep
+#       the managed `Match User` section of each sshd config in sync.
+#
+# WHY PER-ACCOUNT BANNER FILES, and not a login-time hook:
+#
+# The stats block has to reach clients that never open a session channel and
+# never display session output — which is every SSH-tunnel app (HTTP Injector,
+# NPV Tunnel, SocksIP and friends). A ForceCommand wrapper, /etc/ssh/sshrc and
+# /etc/profile.d all write to the session, so all three are invisible to those
+# clients no matter how correctly they are wired.
+#
+# The one thing every client displays is the pre-auth banner, because the SSH
+# protocol delivers it as SSH_MSG_USERAUTH_BANNER before authentication and
+# clients surface it in their connect dialog. sshd can select a different Banner
+# per user through `Match User`, and it evaluates that match before sending the
+# banner — the username is known from the first userauth request. So writing the
+# block into a per-account banner file makes it travel the exact same path as
+# the admin's banner text: the path already proven to work on every protocol.
+#
+# sshd re-reads the banner file on every connection, so refreshing the CONTENT
+# is free — no reload, no restart. Only a change to the SET of accounts rewrites
+# sshd_config and triggers a reload, which is why the timer can run often.
+#
+# Dropbear takes a single global -b file and has no per-user equivalent, so it
+# keeps the static text plus the /etc/profile.d hook for its stats block.
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import syslog
+import tempfile
+
+BANNER_TEXT_FILE = "/etc/ssh/xnet-banner.txt"
+BANNER_DIR = "/etc/ssh/xnet-banners"
+SSHD_CONFIGS = [
+    "/etc/ssh/sshd_config",
+    "/etc/ssh/sshd_config_ws",
+    "/etc/ssh/sshd_config_tls",
+    "/etc/ssh/sshd_config_dns",
+]
+MARK_BEGIN = "# >>> xnet per-account banners (managed - do not edit) >>>"
+MARK_END = "# <<< xnet per-account banners (managed) <<<"
+
+# Usernames are interpolated into sshd_config and into a file path, so anything
+# outside this set is skipped rather than escaped. A name containing whitespace
+# would split the Match line, and one containing * or ? would turn it into a
+# wildcard that hands another account's banner to the wrong user.
+SAFE_USERNAME = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+
+# Fallbacks only — the authoritative location is DATABASE_PATH in /opt/xnet/.env.
+DB_PATHS = [
+    "/opt/xnet/data/xnet.db",
+    "/opt/xnet/xnet.db",
+    "/var/lib/xnet/xnet.db",
+]
+
+
+def diag(msg):
+    # Failures here are invisible to the user (the login hooks discard stderr so
+    # a broken lookup can never garble a tunnel), so leave a trail in syslog —
+    # that is the only way to tell "no stats because this is not a panel
+    # account" apart from "no stats because the DB moved".
+    try:
+        syslog.openlog("xnet-ssh-info", syslog.LOG_PID, syslog.LOG_AUTHPRIV)
+        syslog.syslog(syslog.LOG_WARNING, msg)
+    except Exception:
+        pass
+
+
+def env_db_path():
+    try:
+        with open("/opt/xnet/.env", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("DATABASE_PATH="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return ""
+
+
+def find_db():
+    # The table probe matters: a node that has an empty or partially migrated
+    # xnet.db must be skipped rather than treated as the panel DB.
+    candidates, seen = [], set()
+    for p in [env_db_path()] + DB_PATHS:
+        if p and p not in seen:
+            seen.add(p)
+            candidates.append(p)
+    for p in candidates:
+        if not os.path.isfile(p):
+            continue
+        try:
+            conn = sqlite3.connect(p, timeout=3)
+            conn.execute("SELECT 1 FROM ssh_accounts LIMIT 1")
+            conn.close()
+            return p
+        except Exception:
+            pass
+    diag("no readable DB with an ssh_accounts table; tried: %s" % ", ".join(candidates))
+    return None
+
+
+def human_bytes(n):
+    try:
+        n = int(n)
+    except Exception:
+        return "0 B"
+    if n <= 0:
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def usage_ratio(traffic_used, traffic_limit):
+    """Percent of quota consumed, as a float; None when there is no quota."""
+    try:
+        limit = int(traffic_limit or 0)
+        if limit <= 0:
+            return None
+        return min(int(traffic_used or 0) * 100.0 / limit, 100.0)
+    except Exception:
+        return None
+
+
+def format_percent(ratio):
+    """Render a usage percentage without collapsing small numbers to a flat 0.
+
+    Integer truncation used to print "0%" for anything under one percent, which
+    on a 100 GB quota covers everything up to a gigabyte — the figure looked
+    broken rather than small. Precision now follows magnitude, and a non-zero
+    usage too small to show is reported as such instead of as zero."""
+    if ratio is None:
+        return "Unlimited"
+    if ratio >= 10:
+        return f"{ratio:.0f}%"
+    if ratio >= 1:
+        return f"{ratio:.1f}%"
+    if ratio > 0:
+        return f"{ratio:.2f}%" if ratio >= 0.01 else "<0.01%"
+    return "0%"
+
+
+def format_block(username, expire_date, traffic_limit, traffic_used, max_login):
+    """Render the stats block. Single source of truth for both modes."""
+    expiry_str = str(expire_date)[:10] if expire_date else "No expiry"
+    ratio = usage_ratio(traffic_used, traffic_limit)
+    limit_str = "Unlimited" if ratio is None else human_bytes(traffic_limit)
+    used_str = human_bytes(traffic_used or 0)
+
+    bar_len = 30
+    if ratio is None:
+        # A progress bar against an unlimited quota is meaningless, and drawing
+        # an empty one next to "0%" is what makes an unlimited account look like
+        # a broken one.
+        traffic_line = "  Traffic   : Unlimited"
+    else:
+        filled = int(bar_len * ratio / 100)
+        bar = "#" * filled + "-" * (bar_len - filled)
+        traffic_line = f"  Traffic   : [{bar}] {format_percent(ratio)}"
+
+    max_conn_str = str(int(max_login)) if max_login else "Unlimited"
+    sep = "-" * 50
+    return "\n".join(
+        [
+            sep,
+            f"  Account   : {username}",
+            f"  Expiry    : {expiry_str}",
+            f"  Used      : {used_str} / {limit_str}",
+            traffic_line,
+            f"  Max Conn  : {max_conn_str}",
+            sep,
+        ]
+    )
+
+
+COLUMNS = "username, expire_date, traffic_limit_bytes, traffic_used_bytes, max_login"
+
+
+def fetch_all(db_path):
+    conn = sqlite3.connect(db_path, timeout=5)
+    try:
+        return conn.execute(f"SELECT {COLUMNS} FROM ssh_accounts").fetchall()
+    finally:
+        conn.close()
+
+
+def fetch_one(db_path, username):
+    conn = sqlite3.connect(db_path, timeout=3)
+    try:
+        return conn.execute(
+            f"SELECT {COLUMNS} FROM ssh_accounts WHERE username = ? LIMIT 1",
+            (username,),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def write_atomic(path, content, mode=0o644):
+    """Replace a file in one step so a client connecting mid-write never reads
+    a half-written banner."""
+    directory = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".xnet-tmp-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# ---------------------------------------------------------------- print mode --
+
+
+def cmd_print(username, out):
+    db_path = find_db()
+    if not db_path:
+        return 0
+    try:
+        row = fetch_one(db_path, username)
+    except Exception as exc:
+        diag("query failed for %s on %s: %s" % (username, db_path, exc))
+        return 0
+    # Not a panel account (root, the admin's own login, a system user) — stay quiet.
+    if not row:
+        return 0
+    print(format_block(*row), file=out)
+    try:
+        out.flush()
+    except Exception:
+        pass
+    return 0
+
+
+# -------------------------------------------------------- write-banners mode --
+
+
+def read_banner_text():
+    try:
+        with open(BANNER_TEXT_FILE, encoding="utf-8", errors="replace") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def sync_banner_files(banner_text, rows):
+    """Write one banner file per account; drop files for accounts that are gone.
+    Returns the sorted list of usernames that now have a file."""
+    os.makedirs(BANNER_DIR, exist_ok=True)
+    os.chmod(BANNER_DIR, 0o755)
+
+    wanted = {}
+    for row in rows:
+        username = row[0]
+        if not username or not SAFE_USERNAME.match(username):
+            if username:
+                diag("skipping account with unsupported username: %r" % username)
+            continue
+        wanted[username] = banner_text + "\n" + format_block(*row) + "\n"
+
+    for username, content in wanted.items():
+        path = os.path.join(BANNER_DIR, username + ".txt")
+        try:
+            # Skip the rewrite when nothing changed, so a 2-minute timer does not
+            # churn the disk on an idle server.
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                if fh.read() == content:
+                    continue
+        except OSError:
+            pass
+        try:
+            write_atomic(path, content)
+        except Exception as exc:
+            diag("could not write %s: %s" % (path, exc))
+
+    try:
+        for name in os.listdir(BANNER_DIR):
+            if name.endswith(".txt") and name[:-4] not in wanted:
+                os.unlink(os.path.join(BANNER_DIR, name))
+    except OSError:
+        pass
+
+    return sorted(wanted)
+
+
+def match_section(usernames):
+    if not usernames:
+        return ""
+    lines = [MARK_BEGIN]
+    for username in usernames:
+        # sshd evaluates Match before sending the banner, so this swaps in the
+        # per-account file for exactly this user and leaves the global Banner
+        # (the admin's plain text) in place for everyone else.
+        lines.append(f"Match User {username}")
+        lines.append(f"    Banner {BANNER_DIR}/{username}.txt")
+    lines.append(MARK_END)
+    return "\n".join(lines) + "\n"
+
+
+def strip_section(text):
+    out, skipping = [], False
+    for line in text.splitlines(True):
+        stripped = line.strip()
+        if stripped == MARK_BEGIN:
+            skipping = True
+            continue
+        if stripped == MARK_END:
+            skipping = False
+            continue
+        if not skipping:
+            out.append(line)
+    return "".join(out)
+
+
+def sshd_binary():
+    for candidate in ("/usr/sbin/sshd", "/sbin/sshd", "/usr/bin/sshd"):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def sshd_check(sshd, path):
+    """(ok, message) from `sshd -t -f path`."""
+    try:
+        result = subprocess.run(
+            [sshd, "-t", "-f", path], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
+        return result.returncode == 0, result.stderr.decode("utf-8", "replace").strip()
+    except Exception as exc:
+        return True, "could not run sshd -t: %s" % exc
+
+
+def sshd_accepts(candidate, original):
+    """Decide whether a rewritten sshd config is safe to install.
+
+    This edits the file governing remote access, on a timer, so a candidate that
+    `sshd -t` rejects is normally discarded. But the test is only meaningful as a
+    comparison: several of these configs ship directives that newer OpenSSH
+    releases reject outright (ChallengeResponseAuthentication is the common one),
+    so the ORIGINAL already fails validation. Refusing to write in that case is
+    what silently confined the account block to SSH TCP — the ws/tls/dns configs
+    were skipped every run and never got their Match section.
+
+    So: block only when this change is what broke it. If the original was already
+    rejected, appending Match blocks cannot make it worse, and skipping would
+    keep three protocols broken forever."""
+    sshd = sshd_binary()
+    if sshd is None:
+        return True  # cannot validate; the content is generated, not user input
+    ok, message = sshd_check(sshd, candidate)
+    if ok:
+        return True
+    before_ok, _ = sshd_check(sshd, original)
+    if not before_ok:
+        diag(
+            "%s already fails sshd -t before this change (%s) — applying anyway"
+            % (original, message)
+        )
+        return True
+    diag("sshd -t rejected the generated %s: %s" % (original, message))
+    return False
+
+
+def sshd_config_files():
+    """Every sshd config on the host, not just the four this panel creates.
+
+    Hardcoding the list meant an instance named differently by an older install
+    silently missed out, and a missing file is indistinguishable from a working
+    one. Editor and package backups are excluded so a stale copy never gets
+    Match blocks that then confuse whoever restores it."""
+    import glob
+
+    skip_suffixes = (".bak", ".orig", ".save", ".rpmnew", ".rpmsave", ".dpkg-dist",
+                     ".dpkg-old", ".ucf-dist", "~")
+    found = []
+    for path in sorted(glob.glob("/etc/ssh/sshd_config*")):
+        base = os.path.basename(path)
+        if not os.path.isfile(path) or base.startswith("."):
+            continue
+        if base.endswith(skip_suffixes):
+            continue
+        found.append(path)
+    for path in SSHD_CONFIGS:
+        if os.path.isfile(path) and path not in found:
+            found.append(path)
+    return found
+
+
+def sync_sshd_configs(usernames):
+    """Keep the managed Match section at the END of each sshd config.
+
+    It has to be last: everything after a Match block belongs to that block, so a
+    global directive appended later would silently be scoped to one account. The
+    section is stripped and re-appended on every run to guarantee that ordering.
+
+    Returns (changed, applied, skipped) so the caller can report which protocols
+    actually got the section — a silent skip here is exactly what limited the
+    account block to one protocol."""
+    changed = False
+    applied, skipped = [], []
+    section = match_section(usernames)
+    for cfg in sshd_config_files():
+        try:
+            with open(cfg, encoding="utf-8", errors="replace") as fh:
+                original = fh.read()
+        except OSError as exc:
+            diag("could not read %s: %s" % (cfg, exc))
+            skipped.append(cfg)
+            continue
+        body = strip_section(original)
+        if section:
+            if body and not body.endswith("\n"):
+                body += "\n"
+            body += section
+        if body == original:
+            applied.append(cfg)  # already correct
+            continue
+        # Stage next to the real file so the validated bytes are the ones that
+        # go live, then swap it in.
+        fd, staged = tempfile.mkstemp(dir=os.path.dirname(cfg), prefix=".xnet-sshd-")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(body)
+            os.chmod(staged, 0o644)
+            if not sshd_accepts(staged, cfg):
+                os.unlink(staged)
+                skipped.append(cfg)
+                continue
+            os.replace(staged, cfg)
+            changed = True
+            applied.append(cfg)
+        except Exception as exc:
+            diag("could not write %s: %s" % (cfg, exc))
+            skipped.append(cfg)
+            try:
+                os.unlink(staged)
+            except OSError:
+                pass
+    return changed, applied, skipped
+
+
+def reload_sshd():
+    """Make every running sshd re-read its config.
+
+    A reload is required, not optional: sshd parses its config once at startup
+    and hands the parsed copy to each re-exec'd child over a socketpair, so a
+    Match block added to the file is invisible to the running daemon until it is
+    told to re-read.
+
+    `systemctl reload` alone is not enough. The panel's own sshd-ws / sshd-tls /
+    sshd-dns units were generated without an ExecReload, so reload fails on them
+    with "Job type reload is not applicable" — while the distro's ssh unit does
+    have one. That asymmetry is precisely why the per-account banner worked on
+    SSH TCP and on nothing else: the file was correct for all four, but only one
+    daemon ever re-read it.
+
+    SIGHUP is the fallback: sshd re-execs itself and re-reads the config, and
+    already-forked session children are untouched, so live tunnels survive. A
+    restart is never used — that would drop every connected account."""
+    for unit in ("ssh", "sshd", "sshd-ws", "sshd-tls", "sshd-dns"):
+        try:
+            active = subprocess.run(
+                ["systemctl", "is-active", "--quiet", unit],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if active.returncode != 0:
+                continue
+            reloaded = subprocess.run(
+                ["systemctl", "reload", unit],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if reloaded.returncode == 0:
+                continue
+            hup = subprocess.run(
+                ["systemctl", "kill", "-s", "HUP", unit],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            if hup.returncode != 0:
+                diag("could not make %s re-read its config: %s"
+                     % (unit, hup.stderr.decode("utf-8", "replace").strip()))
+        except Exception as exc:
+            diag("reload of %s failed: %s" % (unit, exc))
+
+
+def remove_all():
+    """Banner disabled: drop the per-account files and the Match sections."""
+    try:
+        for name in os.listdir(BANNER_DIR):
+            if name.endswith(".txt"):
+                os.unlink(os.path.join(BANNER_DIR, name))
+        os.rmdir(BANNER_DIR)
+    except OSError:
+        pass
+    changed, _, _ = sync_sshd_configs([])
+    if changed:
+        reload_sshd()
+
+
+def cmd_write_banners():
+    banner_text = read_banner_text()
+    if not banner_text:
+        remove_all()
+        return 0
+
+    db_path = find_db()
+    if not db_path:
+        # No panel DB here (e.g. a node host). Leave whatever is in place alone
+        # rather than deleting banners this host cannot regenerate.
+        return 0
+    try:
+        rows = fetch_all(db_path)
+    except Exception as exc:
+        diag("could not list accounts on %s: %s" % (db_path, exc))
+        return 0
+
+    usernames = sync_banner_files(banner_text, rows)
+    changed, applied, skipped = sync_sshd_configs(usernames)
+    if changed:
+        reload_sshd()
+
+    # Report per-config, because "it works on one protocol only" is invisible
+    # otherwise: each sshd config backs a different transport.
+    print(
+        "xnet-ssh-info: %d account banner(s); Match section in: %s"
+        % (len(usernames), ", ".join(os.path.basename(p) for p in applied) or "none")
+    )
+    if skipped:
+        for cfg in skipped:
+            print("xnet-ssh-info: WARNING %s was NOT updated — accounts on that "
+                  "transport will see only the plain banner text" % cfg)
+            diag("%s could not be updated" % cfg)
+        return 1
+    return 0
+
+
+# ------------------------------------------------------------------- entry ----
+
+
+def main(argv):
+    if len(argv) > 1 and argv[1] == "--write-banners":
+        return cmd_write_banners()
+
+    username = (argv[1] if len(argv) > 1 and argv[1] else "") \
+        or os.environ.get("SUDO_USER", "") \
+        or os.environ.get("USER", "")
+    if not username or username == "root":
+        return 0
+    # Output stream: argv[2]="stderr" → write to stderr. The hooks pass "stdout"
+    # and redirect themselves, so a stray sudo error on the way cannot be
+    # mistaken for stats output.
+    out = sys.stderr if (len(argv) > 2 and argv[2] == "stderr") else sys.stdout
+    return cmd_print(username, out)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

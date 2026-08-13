@@ -98,6 +98,12 @@ After=network.target
 
 [Service]
 ExecStart=/usr/sbin/sshd -D -f /etc/ssh/sshd_config_${svc}
+# Without ExecReload, "systemctl reload sshd-${svc}" fails outright, so any later
+# edit to sshd_config_${svc} never reaches the running daemon — sshd parses its
+# config once at startup and passes the parsed copy to each connection. SIGHUP
+# makes it re-exec and re-read while leaving established sessions alone, so
+# tunnels are not dropped.
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=5
 

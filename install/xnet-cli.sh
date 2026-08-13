@@ -172,6 +172,75 @@ do_config() {
   esac
 }
 
+# ---- diagnostics & repair ---------------------------------------------------
+# install.sh copies these helpers into $INSTALL_DIR with the .sh suffix stripped
+# (see its "optional helper scripts" loop), so on a live server they are
+# /opt/xnet/xnet-diag-banner and friends — not files in a source tree the
+# operator may not have. These subcommands are the supported way to reach them:
+# before this you had to know the path and the exact filename.
+#
+# run_helper resolves one, explains itself when it is missing rather than
+# printing a bare "command not found", and forwards any extra arguments.
+run_helper() {
+  local name="$1"; shift
+  local path="${INSTALL_DIR}/${name}"
+
+  if [ ! -x "$path" ]; then
+    # Fall back to a .sh sibling so the command also works when run straight
+    # out of a source checkout.
+    if [ -x "${INSTALL_DIR}/${name}.sh" ]; then
+      path="${INSTALL_DIR}/${name}.sh"
+    elif [ -x "$(dirname "$0")/${name}.sh" ]; then
+      path="$(dirname "$0")/${name}.sh"
+    else
+      err "Helper '${name}' is not installed."
+      echo "  Expected: ${INSTALL_DIR}/${name}"
+      echo "  It ships with the installer — re-run 'xnet update' to restore it."
+      return 1
+    fi
+  fi
+
+  bash "$path" "$@"
+}
+
+do_diag() {
+  need_root
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    banner)  run_helper xnet-diag-banner "$@" ;;
+    traffic) run_helper xnet-diag-traffic "$@" ;;
+    *)
+      echo "Usage: xnet diag <banner|traffic> [args]"
+      echo "  banner   why a user's SSH banner is wrong or missing"
+      echo "  traffic  state of the traffic accounting engine"
+      # Asking for help is not a failure; naming something that does not exist
+      # is. Keeping those apart is what makes the exit code worth checking.
+      [ -z "$sub" ] && return 0
+      err "Unknown diagnostic: $sub"
+      return 1
+      ;;
+  esac
+}
+
+do_fix() {
+  need_root
+  local sub="${1:-}"
+  shift || true
+  case "$sub" in
+    banner)  run_helper xnet-fix-banner "$@" ;;
+    sudoers) run_helper xnet-fix-sudoers "$@" ;;
+    *)
+      echo "Usage: xnet fix <banner|sudoers> [args]"
+      echo "  banner   rebuild the per-account banner files"
+      echo "  sudoers  repair the sudoers entry the panel needs to manage users"
+      [ -z "$sub" ] && return 0
+      err "Unknown repair: $sub"
+      return 1
+      ;;
+  esac
+}
+
 # ---- 4) health check --------------------------------------------------------
 do_health() {
   need_root
@@ -494,12 +563,28 @@ case "${1:-}" in
   update|upgrade)            shift || true; do_update "${1:-}" ;;
   config|port|path)          do_config ;;
   health|healthcheck|check)  do_health ;;
+  diag|diagnose)             shift || true; do_diag "$@" ;;
+  fix|repair)                shift || true; do_fix "$@" ;;
   restart)                   shift || true; do_restart "${1:-}" ;;
   timezone|tz)               shift || true; do_timezone "${1:-}" ;;
   uninstall|remove|purge)    do_uninstall ;;
   ""|menu)                   menu ;;
   -h|--help|help)
-    echo "Usage: xnet [deps|update|config|health|restart|timezone|uninstall] (no args = interactive menu)"
+    cat <<'USAGE'
+Usage: xnet <command>   (no args = interactive menu)
+
+  deps                 install/verify prerequisites
+  update               update the panel
+  config               change the port or the secret panel path
+  health               health check
+  diag banner          why a user's SSH banner is wrong or missing
+  diag traffic         state of the traffic accounting engine
+  fix banner           rebuild the per-account banner files
+  fix sudoers          repair the sudoers entry the panel needs
+  restart [target]     restart xnet / sing-box / both
+  timezone [tz]        set the server timezone
+  uninstall            remove the panel
+USAGE
     ;;
   *)
     err "Unknown command: $1"; echo "Run 'xnet help' for usage."; exit 1 ;;
