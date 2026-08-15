@@ -30,6 +30,14 @@ ADMIN_USERNAME=""
 ADMIN_PASSWORD=""
 PASSWORD_GENERATED="false"
 PANEL_PORT=""
+# Port the panel serves PUBLIC subscription links on, separate from the admin
+# panel port so a link handed to a customer never advertises the panel address.
+# Must match handlers.DefaultSubPort in the backend.
+SUB_PORT="${XNET_SUB_PORT:-2096}"
+# Where the PANEL moves to when the operator picks SUB_PORT for it. The
+# subscription port is the one that ends up in customers' links, so it is the
+# one that stays put.
+PANEL_PORT_FALLBACK="2057"
 JWT_SECRET=""
 WEB_BASE_PATH=""
 ACCESS_IP=""
@@ -194,6 +202,15 @@ prompt_port() {
     if ! [[ "$p" =~ ^[0-9]+$ ]] || [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
       warn "Invalid port. Enter a number between 1 and 65535."
       continue
+    fi
+    # The public subscription listener owns SUB_PORT. If the operator picks it
+    # for the panel, both would try to bind the same port and one would lose —
+    # silently, in a log nobody reads. Move the PANEL aside instead of refusing
+    # the input: the subscription port is the one customers see in their links,
+    # so it is the one that should stay predictable.
+    if [ "$p" = "$SUB_PORT" ]; then
+      warn "Port ${p} is reserved for subscription links; using ${PANEL_PORT_FALLBACK} for the panel instead."
+      p="$PANEL_PORT_FALLBACK"
     fi
     PANEL_PORT="$p"
     break
@@ -1886,6 +1903,7 @@ print_summary() {
   echo -e "${C_GRN}${C_BOLD}╚══════════════════════════════════════════════════════════╝${C_RESET}"
   echo
   echo -e "  ${C_BOLD}🌐 Login URL :${C_RESET} http://${ACCESS_IP}:${PANEL_PORT}/${WEB_BASE_PATH}"
+  echo -e "  ${C_BOLD}🔗 Sub Port  :${C_RESET} ${SUB_PORT}  (public subscription links; change in Settings)"
   echo -e "  ${C_BOLD}👤 Username  :${C_RESET} ${ADMIN_USERNAME}"
   echo -e "  ${C_BOLD}🔑 Password  :${C_RESET} ${ADMIN_PASSWORD}"
   if [ -n "${WEB_BASE_PATH}" ]; then
@@ -2001,6 +2019,9 @@ main() {
     install_session_manager
     install_service
     open_firewall "$PANEL_PORT"
+    # The public subscription listener binds its own port; without this rule the
+    # links resolve but never connect.
+    open_firewall "$SUB_PORT"
     print_summary
   fi
 }
