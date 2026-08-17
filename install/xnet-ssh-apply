@@ -148,6 +148,102 @@ ensure_login_group_membership() {
   done
 }
 
+# harden_tunnel_accounts stops panel SSH accounts from getting an interactive
+# shell on the MAIN sshd (the SSH TCP port).
+#
+# The secondary instances (WS / TLS / SlowDNS) have always carried
+# `ForceCommand /bin/cat`, so those ports were already shell-free. The main
+# sshd had no such directive, which is how a tunnel account could `ssh` in and
+# land on a real prompt on the box.
+#
+# WHY A Match BLOCK AND NOT A GLOBAL DIRECTIVE: a global ForceCommand in
+# /etc/ssh/sshd_config applies to EVERY account including root, which would take
+# away the operator's own shell on the next restart — a lockout, delivered by a
+# hardening step. So the directive is confined to a Match block.
+#
+# WHY THE EXCLUSIONS: `Match Group ssh-tcp-users` alone is not safe either,
+# because ensure_login_group_membership deliberately ADDS root and the panel's
+# configured SSH admin to that very group (that is the anti-lockout for
+# AllowGroups). Matching the group without excluding them would hit exactly the
+# two accounts that must keep a shell. Match criteria are ANDed, so adding
+# `User *,!root,!<admin>` narrows it to the panel's tunnel accounts.
+#
+# /bin/cat holds the session channel open without running anything, so a client
+# that requests a shell is not disconnected. Port forwarding is untouched: a
+# forced command replaces the SESSION channel only, never direct-tcpip, which
+# stays governed by AllowTcpForwarding.
+harden_tunnel_accounts() {
+  local cfg=/etc/ssh/sshd_config
+  [ -f "$cfg" ] || return 0
+
+  local marker="# >>> xnet tunnel-account hardening"
+  local endmarker="# <<< xnet tunnel-account hardening"
+
+  # Drop any previous block first so this is idempotent and the exclusion list
+  # tracks a changed admin username instead of accumulating stale blocks.
+  if grep -qF "$marker" "$cfg"; then
+    sed -i "\|^${marker}\$|,\|^${endmarker}\$|d" "$cfg"
+  fi
+
+  # Build the exclusion list: root always, plus the panel's SSH admin when set.
+  local excl="*,!root"
+  local admin="${XNET_SSH_ADMIN_USER:-}"
+  if [ -n "$admin" ] && [ "$admin" != "root" ]; then
+    excl="${excl},!${admin}"
+  fi
+
+  # Match blocks must be LAST in sshd_config: every directive after a Match
+  # belongs to it until the next Match or end of file. Appending guarantees we
+  # never capture unrelated global directives into this block.
+  {
+    echo ""
+    echo "$marker"
+    echo "# Panel SSH accounts are tunnel-only: no interactive shell, no TTY."
+    echo "# root and the panel SSH admin are excluded so the operator keeps shell access."
+    echo "Match Group ssh-tcp-users User ${excl}"
+    # ForceCommand runs INSTEAD of whatever the client asked for. The client's
+    # command is exported as SSH_ORIGINAL_COMMAND and never executed, so
+    # `ssh user@host <cmd>` cannot run anything. /bin/cat holds the session
+    # channel open (tunnel apps that request a shell stay connected) while
+    # doing nothing. direct-tcpip forwarding is a different channel type and is
+    # unaffected — that is what keeps the tunnel working.
+    echo "    ForceCommand /bin/cat"
+    # No PTY: without this a client can still get an interactive terminal
+    # allocated, and anything ForceCommand did not cover would run on it.
+    echo "    PermitTTY no"
+    # THE HOLE ForceCommand DOES NOT CLOSE: sshd executes ~/.ssh/rc with /bin/sh
+    # on every login, before and independently of ForceCommand. A user whose
+    # home directory is writable — which every panel account's is — could drop
+    # arbitrary commands there and get them executed on each connection. This
+    # is the directive that actually stops shell access, not ForceCommand.
+    echo "    PermitUserRC no"
+    echo "    X11Forwarding no"
+    echo "    AllowAgentForwarding no"
+    echo "$endmarker"
+  } >> "$cfg"
+
+  log "Hardening: panel SSH accounts on the main sshd are shell-free (excluded: root${admin:+, $admin})"
+
+  # The secondary instances (WS / TLS / SlowDNS) serve ONLY panel tunnel
+  # accounts — no administrator ever logs in through them — so they take the
+  # same directives globally, with no Match block and no exclusions.
+  #
+  # They shipped with `ForceCommand /bin/cat` from the start, which is why those
+  # ports never handed out a prompt. What they were missing is PermitUserRC:
+  # ~/.ssh/rc is executed by sshd itself, so it bypassed ForceCommand entirely
+  # and gave a user with a writable home a way to run commands on every connect.
+  local scfg
+  for scfg in /etc/ssh/sshd_config_ws /etc/ssh/sshd_config_tls /etc/ssh/sshd_config_dns; do
+    [ -f "$scfg" ] || continue
+    set_sshd_directive "$scfg" "ForceCommand" "/bin/cat"
+    set_sshd_directive "$scfg" "PermitTTY" "no"
+    set_sshd_directive "$scfg" "PermitUserRC" "no"
+    set_sshd_directive "$scfg" "X11Forwarding" "no"
+    set_sshd_directive "$scfg" "AllowAgentForwarding" "no"
+    log "Hardening: $(basename "$scfg") is shell-free (ForceCommand + PermitTTY/PermitUserRC off)"
+  done
+}
+
 # --- Helper: Update Port directive in sshd config (preserves AllowGroups) ----
 update_sshd_port() {
   local config_file="$1" new_port="$2"
@@ -607,6 +703,9 @@ apply_openssh() {
   # is still permitted by AllowGroups and that the new port is reachable through
   # any active firewall. Without these, a port change can lock the operator out.
   ensure_login_group_membership
+  # Runs AFTER the anti-lockout so the exclusion list is applied on top of the
+  # membership it just guaranteed, and BEFORE the restart so both land together.
+  harden_tunnel_accounts
   if [ "$enabled" = "true" ] && [[ "$port" =~ ^[0-9]+$ ]]; then
     open_fw_port "$port"
   fi
@@ -808,12 +907,36 @@ apply_dropbear() {
   # Banner flag: -b <file> when a banner file exists
   local banner_flag=""
   [ -f "$XNET_BANNER_FILE" ] && banner_flag="-b ${XNET_BANNER_FILE}"
+  # -c: forced command. Dropbear has no ForceCommand directive and no config
+  # file to put one in, so this flag is the only way to stop a tunnel account
+  # from getting an interactive shell on the Dropbear port. Without it any
+  # panel SSH account could `ssh` in and land on a real prompt.
+  #
+  # /bin/cat mirrors what the WS/TLS/SlowDNS sshd instances already force: it
+  # holds the session channel open (so clients that ask for a shell are not
+  # disconnected) while executing nothing. Port forwarding is unaffected —
+  # a forced command replaces the SESSION channel only, never direct-tcpip.
+  #
+  # Applying it to the whole daemon is safe here because Dropbear is a
+  # tunnel-only port: the administrator's shell access is the main sshd, which
+  # keeps its interactive shell (see harden_tunnel_accounts).
+  #
+  # Probed rather than assumed: dropbear rejects unknown flags and exits, so
+  # hardcoding -c on a build that lacks it would leave the unit in a restart
+  # loop and take the Dropbear port down completely. `dropbear -h` prints its
+  # usage to stderr and exits non-zero, hence the redirect and the `|| true`.
+  local forced_cmd=""
+  if "$bin" -h 2>&1 | grep -qE '^[[:space:]]*-c[[:space:]]'; then
+    forced_cmd="-c /bin/cat"
+  else
+    log "WARNING: this dropbear build has no -c (forced command) flag — accounts on the Dropbear port can obtain a shell. Consider disabling Dropbear in the panel."
+  fi
   cat > /etc/systemd/system/dropbear.service <<UNIT
 [Unit]
 Description=Dropbear SSH server (xnet-managed)
 After=network.target
 [Service]
-ExecStart=${bin} -F -E -p ${port} ${ka} ${banner_flag}
+ExecStart=${bin} -F -E -p ${port} ${ka} ${banner_flag} ${forced_cmd}
 Restart=on-failure
 [Install]
 WantedBy=multi-user.target
