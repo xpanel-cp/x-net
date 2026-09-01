@@ -487,6 +487,247 @@ persist_tcp_early_demux() {
   ok "Persisted net.ipv4.tcp_early_demux=1 to $sysctl_file."
 }
 
+
+# ensure_session_gate_pam registers the admission gate in the PAM account stack
+# so a login that would exceed max_login is refused during authentication rather
+# than killed a few seconds after it succeeds.
+#
+# It is added to /etc/pam.d/sshd, which every OpenSSH instance the panel runs
+# authenticates through (the main daemon and the ws/tls/dns instances share the
+# service name). Dropbear is NOT covered: Debian and Ubuntu build it against
+# shadow rather than PAM, so there is no hook to attach to and Dropbear accounts
+# stay on the panel's after-the-fact enforcement.
+#
+# Idempotent: the line is added once, and a copy of the original stack is kept
+# because a broken PAM file locks every login out and the operator needs
+# something to restore from over a console.
+ensure_session_gate_pam() {
+  local gate="${INSTALL_DIR}/xnet-session-gate"
+  local pamfile="/etc/pam.d/sshd"
+  [ -f "$gate" ] || return 0
+  if [ ! -f "$pamfile" ]; then
+    warn "$pamfile not found — SSH session admission gate not registered."
+    return 0
+  fi
+
+  if grep -q "xnet-session-gate" "$pamfile" 2>/dev/null; then
+    ok "SSH session admission gate already registered in PAM."
+    return 0
+  fi
+
+  cp -a "$pamfile" "${pamfile}.xnet-backup" 2>/dev/null || true
+  {
+    echo ""
+    echo "# X-NET: refuse a login that would exceed the account's max_login."
+    echo "account required pam_exec.so quiet ${gate}"
+  } >> "$pamfile"
+  ok "SSH session admission gate registered in PAM (${pamfile})."
+}
+
+# ----- system log rotation ----------------------------------------------------
+# Bound the growth of the system logs the panel is the heaviest writer to.
+#
+# Every privileged action the panel takes goes through `sudo`, and sudo writes a
+# session-open and a session-close line to /var/log/auth.log for each one. A
+# build that ran hundreds of sudo calls per second therefore wrote auth.log (and
+# syslog, which mirrors it) at a rate no default policy anticipates. Both files
+# reached several GB, the filesystem hit 100%, and the panel then could not even
+# open its database: SQLite could not create the -shm file WAL mode needs and
+# failed with an opaque "disk I/O error (4874)".
+#
+# The write amplification itself is fixed in the backend. This is the second line
+# of defence, so a future misbehaving writer costs disk space instead of taking
+# the node down.
+#
+# Everything here is additive and idempotent, and NOTHING here rotates, deletes
+# or truncates a log: logrotate is only ever invoked with -d (debug/dry-run),
+# which changes nothing. Existing logs are left exactly as they are.
+#
+# The three paths below are overridable ONLY so the logic can be exercised
+# against a throwaway filesystem; installs always use the defaults.
+XNET_LOGROTATE_DIR="${XNET_LOGROTATE_DIR:-/etc/logrotate.d}"
+XNET_LOGROTATE_CONF="${XNET_LOGROTATE_CONF:-/etc/logrotate.conf}"
+XNET_LOGROTATE_FILE="${XNET_LOGROTATE_DIR}/xnet-system-logs"
+XNET_LOGROTATE_TARGETS="${XNET_LOGROTATE_TARGETS:-/var/log/auth.log /var/log/syslog}"
+
+# lr_ensure_installed makes logrotate available, installing it only when a
+# package manager is present. Returns non-zero when logrotate cannot be used.
+lr_ensure_installed() {
+  if command -v logrotate >/dev/null 2>&1; then
+    return 0
+  fi
+  if command -v apt-get >/dev/null 2>&1; then
+    info "logrotate not present — installing…"
+    apt_install logrotate || true
+  fi
+  command -v logrotate >/dev/null 2>&1
+}
+
+# lr_paths_managed_elsewhere prints every log path that the CURRENT logrotate
+# configuration already handles, EXCLUDING our own file.
+#
+# Excluding our own file is what makes the check meaningful on a re-run: without
+# it, the second install would see the paths covered (by us) and could never tell
+# that apart from the system covering them. The exclusion is done by dry-running
+# a throwaway copy of the configuration rather than by touching /etc, so an
+# interrupted run cannot leave the real configuration modified.
+#
+# `logrotate -d` is a dry run: it neither rotates logs nor runs postrotate
+# scripts nor writes its state file (which is redirected anyway).
+lr_paths_managed_elsewhere() {
+  local tmpdir conf f
+  tmpdir="$(mktemp -d 2>/dev/null)" || return 1
+  mkdir -p "$tmpdir/d"
+  for f in "$XNET_LOGROTATE_DIR"/*; do
+    [ -f "$f" ] || continue
+    [ "$f" = "$XNET_LOGROTATE_FILE" ] && continue
+    cp "$f" "$tmpdir/d/" 2>/dev/null || true
+  done
+  conf="$tmpdir/logrotate.conf"
+  # Reproduce the global section without its include line, then point the copy at
+  # our filtered directory.
+  if [ -f "$XNET_LOGROTATE_CONF" ]; then
+    sed 's#^[[:space:]]*include[[:space:]].*##' "$XNET_LOGROTATE_CONF" > "$conf" 2>/dev/null || : > "$conf"
+  else
+    : > "$conf"
+  fi
+  printf 'include %s\n' "$tmpdir/d" >> "$conf"
+  logrotate -d -s "$tmpdir/state" "$conf" 2>&1 | sed -n 's/^considering log //p' | sort -u
+  rm -rf "$tmpdir"
+}
+
+# lr_grep_managed_elsewhere is the fallback used when the dry run cannot be
+# produced (very old logrotate, or a configuration it refuses to parse). It reads
+# the files directly, with comments stripped so a commented-out example is not
+# mistaken for a live rule.
+#
+# A false positive here means "we leave this path alone", which is the safe
+# direction: a log rotated by nobody wastes space, a log rotated by two rules can
+# lose data.
+lr_grep_managed_elsewhere() {
+  local path="$1" f
+  for f in "$XNET_LOGROTATE_CONF" "$XNET_LOGROTATE_DIR"/*; do
+    [ -f "$f" ] || continue
+    [ "$f" = "$XNET_LOGROTATE_FILE" ] && continue
+    if sed 's/#.*//' "$f" 2>/dev/null | grep -qF "$path"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+configure_logrotate() {
+  if [ "$(uname -s)" != "Linux" ]; then
+    return 0
+  fi
+  info "Configuring log rotation…"
+
+  if ! lr_ensure_installed; then
+    warn "logrotate is unavailable and could not be installed — skipping log rotation setup."
+    warn "System logs will not be size-bounded on this host."
+    return 0
+  fi
+
+  # What the rest of the system already rotates.
+  local managed uncovered=() covered=() path
+  managed="$(lr_paths_managed_elsewhere 2>/dev/null)"
+
+  for path in $XNET_LOGROTATE_TARGETS; do
+    if [ -n "$managed" ]; then
+      # Exact match, or a glob rule that logrotate expanded to this path.
+      if printf '%s\n' "$managed" | grep -qxF "$path"; then
+        covered+=("$path")
+        continue
+      fi
+    elif lr_grep_managed_elsewhere "$path"; then
+      covered+=("$path")
+      continue
+    fi
+    uncovered+=("$path")
+  done
+
+  if [ "${#covered[@]}" -gt 0 ]; then
+    info "Already rotated by the system's own policy: ${covered[*]}"
+  fi
+
+  # Self-healing: if the distribution (or the admin) has since taken over every
+  # path we added, our file is now a SECOND rule for those logs. Two rules
+  # rotating one file is worse than none, so ours is withdrawn.
+  if [ "${#uncovered[@]}" -eq 0 ]; then
+    if [ -f "$XNET_LOGROTATE_FILE" ]; then
+      rm -f "$XNET_LOGROTATE_FILE"
+      ok "System policy now covers these logs — removed the redundant ${XNET_LOGROTATE_FILE}."
+    else
+      ok "Logrotate already configured"
+    fi
+    return 0
+  fi
+
+  # Write (or rewrite) our file for exactly the paths nothing else handles.
+  local tmp
+  tmp="$(mktemp 2>/dev/null)" || { warn "Could not create a temporary file — skipping log rotation setup."; return 0; }
+  {
+    echo "# Managed by the X-NET installer. Regenerated on every install/upgrade."
+    echo "#"
+    echo "# Covers only the system logs that no other logrotate configuration on"
+    echo "# this host already handles, so a log is never rotated by two rules."
+    echo "# If the distribution later takes one of these over, the installer"
+    echo "# removes it from here automatically."
+    for path in "${uncovered[@]}"; do
+      echo "$path"
+    done
+    echo "{"
+    echo "    weekly"
+    echo "    rotate 4"
+    echo "    compress"
+    echo "    delaycompress"
+    echo "    missingok"
+    echo "    notifempty"
+    echo "}"
+  } > "$tmp"
+
+  # Nothing to do if the file is already byte-identical — keeps re-runs silent
+  # and leaves the mtime alone.
+  if [ -f "$XNET_LOGROTATE_FILE" ] && cmp -s "$tmp" "$XNET_LOGROTATE_FILE"; then
+    rm -f "$tmp"
+    ok "Logrotate already configured"
+    return 0
+  fi
+
+  # Validate BEFORE the new file is in place, by dry-running a copy of the whole
+  # configuration with our candidate included. An invalid file is never written.
+  local vdir vconf f
+  vdir="$(mktemp -d 2>/dev/null)"
+  if [ -n "$vdir" ]; then
+    mkdir -p "$vdir/d"
+    for f in "$XNET_LOGROTATE_DIR"/*; do
+      [ -f "$f" ] || continue
+      [ "$f" = "$XNET_LOGROTATE_FILE" ] && continue
+      cp "$f" "$vdir/d/" 2>/dev/null || true
+    done
+    cp "$tmp" "$vdir/d/xnet-system-logs"
+    vconf="$vdir/logrotate.conf"
+    if [ -f "$XNET_LOGROTATE_CONF" ]; then
+      sed 's#^[[:space:]]*include[[:space:]].*##' "$XNET_LOGROTATE_CONF" > "$vconf" 2>/dev/null || : > "$vconf"
+    else
+      : > "$vconf"
+    fi
+    printf 'include %s\n' "$vdir/d" >> "$vconf"
+    if ! logrotate -d -s "$vdir/state" "$vconf" >/dev/null 2>&1; then
+      warn "The generated logrotate policy did not validate — leaving the existing configuration untouched."
+      rm -f "$tmp"; rm -rf "$vdir"
+      return 0
+    fi
+    rm -rf "$vdir"
+  fi
+
+  install -m 0644 -o root -g root "$tmp" "$XNET_LOGROTATE_FILE"
+  rm -f "$tmp"
+
+  info "Logrotate policy: weekly, 4 rotations, compressed"
+  ok "Log rotation configured successfully (${uncovered[*]} → ${XNET_LOGROTATE_FILE})"
+}
+
 # ----- install sing-box core --------------------------------------------------
 # The panel/agent shells out to the sing-box binary to apply inbound configs and
 # to collect per-user traffic. We pin an exact version and (re)install it when
@@ -759,6 +1000,7 @@ install_ssh_subsystems() {
   # having the symlink already present means a dropbear installed later by hand
   # is gated from its first start rather than briefly open to every account.
   ensure_dropbear_user_gate
+  ensure_session_gate_pam
   ensure_dropbear_unit
   ensure_stunnel_unit
   ensure_udpgw_unit
@@ -943,6 +1185,7 @@ EOF
   done
 
   ensure_dropbear_user_gate
+  ensure_session_gate_pam
   systemctl enable --now dropbear >/dev/null 2>&1 || true
   ok "Dropbear unit ready and started."
 }
@@ -1259,8 +1502,8 @@ GatewayPorts clientspecified
 # these, a dropped mobile connection leaves a half-open session alive forever,
 # which keeps showing the user as online and consumes a max_login slot. The
 # panel overwrites both values from its SSH settings on every apply.
-ClientAliveInterval 60
-ClientAliveCountMax 3
+ClientAliveInterval 15
+ClientAliveCountMax 2
 Subsystem sftp ${sftp}
 EOF
     cat > "/etc/systemd/system/sshd-${svc}.service" <<EOF
@@ -1423,6 +1666,29 @@ deploy_files() {
     ok "Management CLI installed (run: xnet)."
   fi
 
+  # --- Session admission gate (PAM) ---
+  # Refuses a login that would exceed max_login, at authentication time, so the
+  # client gets a clean "too many logins" instead of connecting and being killed
+  # a few seconds later. Root-owned: PAM runs it as root during authentication,
+  # so the unprivileged panel user must not be able to rewrite it.
+  if [ -f "$SCRIPT_DIR/xnet-session-gate.sh" ]; then
+    install -m 0755 "$SCRIPT_DIR/xnet-session-gate.sh" "${INSTALL_DIR}/xnet-session-gate"
+    ok "SSH session admission gate installed."
+  fi
+
+  # --- In-panel updater ---
+  # Lets the Dashboard move the panel to any published release. It runs DETACHED
+  # (systemd-run) because install.sh restarts the panel partway through, so it
+  # cannot be a child of the process that asked for the update.
+  #
+  # Root-owned like the other privileged helpers: the unprivileged panel user
+  # launches it through sudo, so it must not be a file that same user can
+  # rewrite — that would turn a panel compromise into arbitrary root execution.
+  if [ -f "$SCRIPT_DIR/xnet-update.sh" ]; then
+    install -m 0755 "$SCRIPT_DIR/xnet-update.sh" "${INSTALL_DIR}/xnet-update"
+    ok "In-panel updater installed (Dashboard → panel version)."
+  fi
+
   # --- Ownership (MUST come before setcap — chown strips capabilities!) ---
   chown -R "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}" /etc/sing-box
   chown -R "${SERVICE_USER}:${SERVICE_USER}" /var/lib/xnet 2>/dev/null || true
@@ -1432,7 +1698,10 @@ deploy_files() {
   # account, so they must stay root-owned — the unprivileged panel user must not
   # be able to rewrite a script that any account can then run as root.
   # (xnet-fc / xnet-fc-pam are the retired v8 hooks; xnet-ssh-apply deletes them.)
-  for helper in xnet-ssh-info xnet-ssh-greet; do
+  # xnet-update is here for the same reason: the unprivileged panel user
+  # launches it through sudo, so it must not be a file that same user can
+  # rewrite — that would turn a panel compromise into arbitrary root execution.
+  for helper in xnet-ssh-info xnet-ssh-greet xnet-update xnet-session-gate; do
     if [ -f "${INSTALL_DIR}/${helper}" ]; then
       chown root:root "${INSTALL_DIR}/${helper}" 2>/dev/null || true
       chmod 0755 "${INSTALL_DIR}/${helper}"
@@ -1977,6 +2246,7 @@ main() {
 
   install_deps
   persist_tcp_early_demux
+  configure_logrotate
   install_singbox
   install_ssh_subsystems
 

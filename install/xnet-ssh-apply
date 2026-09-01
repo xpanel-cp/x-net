@@ -620,13 +620,26 @@ remove_legacy_hooks() {
 # Applied to the main sshd AND to the three internal instances that back the
 # WS / TLS / SlowDNS transports — those carry the same defect, so fixing only
 # the main config would leave four of the six protocols still leaking sessions.
+# The default is 15s x 2 = 30 seconds, not the old 60 x 3 = 180.
+#
+# That number is how long a DEAD session keeps its max_login slot. When a client
+# vanishes without closing (mobile handover, app killed, network drop) the TCP
+# connection stays ESTABLISHED and sshd keeps the session process alive until
+# these probes fail — so with 180 seconds, an account with max_login=3 whose
+# user reconnected could find all three slots held by connections that no longer
+# existed, and every new attempt was refused for three minutes. That is the
+# "connects, drops, reconnects" loop operators were reporting.
+#
+# Shortening it is safe because the probe is answered by the SSH transport
+# itself, not by the tunnelled application: a live client always replies, however
+# idle the tunnel is. Only a peer that is genuinely gone fails to answer.
 apply_ssh_keepalive() {
   local interval count
-  interval="$(jget '.openssh.keepAlive' '60')"
+  interval="$(jget '.openssh.keepAlive' '15')"
   # 0 or a non-numeric value means "disabled": clear the probes rather than
   # writing a broken directive that would stop sshd from starting.
   [[ "$interval" =~ ^[0-9]+$ ]] || interval=60
-  count=3
+  count=2
   if [ "$interval" -le 0 ]; then
     interval=0
     count=0
