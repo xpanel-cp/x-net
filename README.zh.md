@@ -88,7 +88,7 @@ systemctl restart xnet     # 重启服务
 
 ### SSH
 
-`SSH-over-WebSocket` · `Stunnel/TLS` · `SlowDNS` · `Dropbear` · `BadVPN/UDPGW`
+`SSH (direct TCP)` · `SSH-over-WebSocket` · `SSH WS + TLS` · `Stunnel/TLS` · `SlowDNS` · `Dropbear` · `BadVPN/UDPGW`
 
 ## 功能特性
 
