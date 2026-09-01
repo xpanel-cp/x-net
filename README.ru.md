@@ -88,7 +88,7 @@ systemctl restart xnet     # Перезапуск службы
 
 ### SSH
 
-`SSH-over-WebSocket` · `Stunnel/TLS` · `SlowDNS` · `Dropbear` · `BadVPN/UDPGW`
+`SSH (direct TCP)` · `SSH-over-WebSocket` · `SSH WS + TLS` · `Stunnel/TLS` · `SlowDNS` · `Dropbear` · `BadVPN/UDPGW`
 
 ## Возможности
 
