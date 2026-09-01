@@ -76,7 +76,7 @@ systemctl restart xnet     # Перезапуск службы
 
 ### Основные протоколы (Sing-box)
 
-`VLESS` · `VMess` · `Trojan` · `Shadowsocks` · `SOCKS` · `HTTP` · `TUIC` · `Hysteria2`
+`VLESS` · `VMess` · `Trojan` · `Shadowsocks` · `SOCKS` · `HTTP` · `TUIC` · `Hysteria` · `Hysteria2` · `AnyTLS` · `WireGuard` · `Mixed` · `ShadowTLS` · `NaiveProxy`
 
 ### Транспорты
 
