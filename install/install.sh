@@ -48,7 +48,7 @@ NODE_API_KEY=""
 NODE_SECRET_KEY=""
 NODE_ID=""
 # Pinned sing-box core version installed/verified by install_singbox.
-SINGBOX_VERSION="1.13.13"
+SINGBOX_VERSION="1.14.0"
 # X-NET ships a PREBUILT sing-box core that already includes the with_v2ray_api
 # build tag (required for authoritative per-UUID V2Ray Stats accounting — the
 # official upstream release binaries do NOT include it). We download it from this
