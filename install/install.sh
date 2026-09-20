@@ -47,6 +47,18 @@ AGENT_ALLOWED_CIDRS=""
 NODE_API_KEY=""
 NODE_SECRET_KEY=""
 NODE_ID=""
+# PANEL_URL is the control panel this node can call BACK to.
+#
+# Every other control-plane path is push: the panel signs a request and calls
+# the agent. A node behind NAT is exactly what cannot be called, so for reverse
+# tunnelling it pulls its own configuration instead. Empty means it never does,
+# which is how every install behaved before this existed.
+PANEL_URL=""
+# REVERSE_CONTROL_PORT is where a node acting as the PUBLIC side of a reverse
+# tunnel accepts registrations from private nodes. It matches
+# reverse.DefaultControlPort in the panel; a per-node override lives in the
+# panel database, and the panel opens whatever port it actually binds at runtime.
+REVERSE_CONTROL_PORT="8443"
 # Pinned sing-box core version installed/verified by install_singbox.
 SINGBOX_VERSION="1.14.0"
 # X-NET ships a PREBUILT sing-box core that already includes the with_v2ray_api
@@ -249,6 +261,14 @@ prompt_role() {
     # these EXACT values into the panel when registering this node, so both
     # sides share the same secret. Startup upserts a matching nodes row from the
     # NODE_API_KEY / NODE_SECRET_KEY written to .env.
+    echo
+    echo -e "  ${C_BOLD}Panel URL (optional)${C_RESET}"
+    echo -e "  Where this node can reach the control panel, e.g. https://panel.example.com:2087"
+    echo -e "  Needed only for reverse tunnelling, where a node behind NAT asks the panel"
+    echo -e "  for its own configuration because the panel cannot call it. Leave empty to skip."
+    read -r -p "  PANEL_URL: " PANEL_URL
+    PANEL_URL="$(echo "$PANEL_URL" | tr -d ' ' | sed 's#/*$##')"
+
     NODE_API_KEY="xnetnode_$(rand_hex 16)"
     NODE_SECRET_KEY="$(rand_hex 32)"
     NODE_ID="node-agent-self"
@@ -488,40 +508,64 @@ persist_tcp_early_demux() {
 }
 
 
-# ensure_session_gate_pam registers the admission gate in the PAM account stack
-# so a login that would exceed max_login is refused during authentication rather
-# than killed a few seconds after it succeeds.
+# disable_session_gate_pam takes the admission gate OUT of the PAM account stack,
+# and removes it from hosts where an earlier installer put it there.
 #
-# It is added to /etc/pam.d/sshd, which every OpenSSH instance the panel runs
-# authenticates through (the main daemon and the ws/tls/dns instances share the
-# service name). Dropbear is NOT covered: Debian and Ubuntu build it against
-# shadow rather than PAM, so there is no hook to attach to and Dropbear accounts
-# stay on the panel's after-the-fact enforcement.
+# The gate refused a login at authentication time when the account already held
+# max_login sessions. That is the right shape for a limit, but not with the
+# count it used: `pgrep -u <user> -c` counts every process the account owns, and
+# one SSH TCP connection is an sshd child plus the login shell. So one live
+# connection already reads as two, and the account is refused at half the cap it
+# was sold.
 #
-# Idempotent: the line is added once, and a copy of the original stack is kept
-# because a broken PAM file locks every login out and the operator needs
-# something to restore from over a console.
-ensure_session_gate_pam() {
-  local gate="${INSTALL_DIR}/xnet-session-gate"
-  local pamfile="/etc/pam.d/sshd"
-  [ -f "$gate" ] || return 0
-  if [ ! -f "$pamfile" ]; then
-    warn "$pamfile not found — SSH session admission gate not registered."
-    return 0
-  fi
+# It also contradicts the enforcement the panel now performs. The monitor gives
+# an over-limit account a grace period before taking anything, because a client
+# reconnecting after a network drop is over the limit for exactly as long as its
+# previous connection takes to die — measured on a live node, those overlaps
+# resolve themselves and nothing needs to be killed at all. The gate refuses
+# that reconnect outright: the new connection is never created, so the grace
+# period never gets to apply and the customer cannot get back on until the old
+# connection's processes are reaped.
+#
+# Two mechanisms, opposite policies, and which one was in force depended on
+# whether `sqlite3` happened to be installed — the gate exits 0 and enforces
+# nothing without it. Connection admission must not vary with the accidental
+# presence of a CLI tool, so the panel's monitor is now the single owner of
+# max_login and this hook is removed.
+#
+# The xnet-session-gate script itself stays installed; only its place in the
+# authentication path is withdrawn. Reinstating it is one line, should a future
+# design want a pre-authentication gate with a count that means something.
+disable_session_gate_pam() {
+  # XNET_PAM_SSHD exists so this can be exercised against a fixture instead of
+  # the live stack; nothing sets it in normal operation.
+  local pamfile="${XNET_PAM_SSHD:-/etc/pam.d/sshd}"
+  [ -f "$pamfile" ] || return 0
+  grep -q "xnet-session-gate" "$pamfile" 2>/dev/null || return 0
 
-  if grep -q "xnet-session-gate" "$pamfile" 2>/dev/null; then
-    ok "SSH session admission gate already registered in PAM."
-    return 0
-  fi
-
+  # This file is in the authentication path of every SSH login on the host, so
+  # the edit is staged and checked before it replaces the original. A truncated
+  # or emptied PAM stack locks every account out, including the operator's.
   cp -a "$pamfile" "${pamfile}.xnet-backup" 2>/dev/null || true
-  {
-    echo ""
-    echo "# X-NET: refuse a login that would exceed the account's max_login."
-    echo "account required pam_exec.so quiet ${gate}"
-  } >> "$pamfile"
-  ok "SSH session admission gate registered in PAM (${pamfile})."
+  local tmp
+  tmp="$(mktemp)" || { warn "Could not create a temp file — PAM gate left in place."; return 0; }
+  sed -e '/xnet-session-gate/d' \
+      -e '/^# X-NET: refuse a login that would exceed/d' \
+      "$pamfile" > "$tmp" 2>/dev/null
+
+  # The result must still be a usable stack: non-empty, and still carrying at
+  # least one directive. Anything less means the edit went wrong, and the
+  # original is kept.
+  if [ ! -s "$tmp" ] || ! grep -qE '^[[:space:]]*(auth|account|session|password)[[:space:]]' "$tmp"; then
+    rm -f "$tmp"
+    warn "Refusing to rewrite $pamfile — the result did not look like a valid PAM stack."
+    warn "The session gate is still registered. Remove it by hand:  sed -i '/xnet-session-gate/d' $pamfile"
+    return 0
+  fi
+
+  cat "$tmp" > "$pamfile" && rm -f "$tmp"
+  ok "SSH session admission gate removed from PAM (max_login is enforced by the panel)."
+  ok "Previous stack saved at ${pamfile}.xnet-backup."
 }
 
 # ----- system log rotation ----------------------------------------------------
@@ -1000,7 +1044,7 @@ install_ssh_subsystems() {
   # having the symlink already present means a dropbear installed later by hand
   # is gated from its first start rather than briefly open to every account.
   ensure_dropbear_user_gate
-  ensure_session_gate_pam
+  disable_session_gate_pam
   ensure_dropbear_unit
   ensure_stunnel_unit
   ensure_udpgw_unit
@@ -1185,7 +1229,7 @@ EOF
   done
 
   ensure_dropbear_user_gate
-  ensure_session_gate_pam
+  disable_session_gate_pam
   systemctl enable --now dropbear >/dev/null 2>&1 || true
   ok "Dropbear unit ready and started."
 }
@@ -1881,6 +1925,7 @@ NODE_CLIENT_SCHEME=http
 NODE_ID=${NODE_ID}
 NODE_API_KEY=${NODE_API_KEY}
 NODE_SECRET_KEY=${NODE_SECRET_KEY}
+PANEL_URL=${PANEL_URL}
 EOF
   chmod 600 "${INSTALL_DIR}/.env"
   chown "${SERVICE_USER}:${SERVICE_USER}" "${INSTALL_DIR}/.env"
@@ -1948,6 +1993,43 @@ SESSION_MANAGER_ACTOR_ID=${SM_ACTOR_ID}
 SESSION_MANAGER_ADMIN_SECRET=${SM_ADMIN_SECRET}
 EOF
   ok "Session Manager wiring added to panel .env."
+}
+
+# ensure_ssh_enforce_trace_env turns on the SSH enforcement trace.
+#
+# The panel enforces max_login after the fact: an account over its limit is
+# given a grace period, and only a session that is still over it when the grace
+# matures is taken. That makes the interesting events the ones where NOTHING was
+# killed — an overlap that resolved on its own, or a streak held across a dip —
+# and without the trace none of them are recorded. The operator then sees two
+# connections on a max_login=1 account and has no way to tell whether the limit
+# is broken or simply waiting.
+#
+# The three lines it enables are what answer that:
+#
+#	overlap_started   the account went over its limit; the grace is running
+#	overlap_held      it dipped back, but the streak is held, not restarted
+#	overlap_resolved  the overlap ended on its own and nothing was killed
+#
+# The ratio of overlap_resolved to enforce is also the measure of what the grace
+# period is worth: every resolved overlap is a customer who would have been
+# disconnected by the old immediate-kill behaviour.
+#
+# Appended only when absent, so an operator who set it to 0 keeps that. Written
+# with a leading newline guard because appending to a file that does not end in
+# one would splice the key onto the previous value and corrupt both.
+ensure_ssh_enforce_trace_env() {
+  [ -f "${INSTALL_DIR}/.env" ] || return 0
+  if grep -q '^XNET_SSH_ENFORCE_TRACE=' "${INSTALL_DIR}/.env" 2>/dev/null; then
+    return 0
+  fi
+  # A file that does not end in a newline would have the key spliced onto its
+  # last value — two broken settings instead of one new one.
+  if [ -s "${INSTALL_DIR}/.env" ] && [ -n "$(tail -c1 "${INSTALL_DIR}/.env")" ]; then
+    echo "" >> "${INSTALL_DIR}/.env"
+  fi
+  echo "XNET_SSH_ENFORCE_TRACE=1" >> "${INSTALL_DIR}/.env"
+  ok "SSH enforcement trace enabled (XNET_SSH_ENFORCE_TRACE=1)."
 }
 
 # ensure_session_admission_env turns on the in-core, pre-connection device-limit
@@ -2263,6 +2345,7 @@ main() {
     sm_prepare_secrets
     sm_ensure_panel_env
     ensure_session_admission_env
+    ensure_ssh_enforce_trace_env
     install_session_manager
     install_service
     # Ensure the API port is open on upgrade too (older installs / agent nodes
@@ -2286,12 +2369,19 @@ main() {
     create_env
     sm_ensure_panel_env
     ensure_session_admission_env
+    ensure_ssh_enforce_trace_env
     install_session_manager
     install_service
     open_firewall "$PANEL_PORT"
     # The public subscription listener binds its own port; without this rule the
     # links resolve but never connect.
     open_firewall "$SUB_PORT"
+    # The reverse-tunnel control channel. A private node dials IN to this port,
+    # so a node acting as the public side is unreachable without it — and the
+    # panel would still show the endpoint as configured, which is the confusing
+    # half. The panel opens it again at runtime when an endpoint is created;
+    # doing it here means the port is ready before the first one exists.
+    open_firewall "$REVERSE_CONTROL_PORT"
     print_summary
   fi
 }
