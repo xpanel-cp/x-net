@@ -1952,47 +1952,191 @@ effective_node_role() {
   esac
 }
 
-# sm_prepare_secrets resolves the admin + node HMAC secrets used by BOTH the
-# manager service and the panel, reusing any that already exist so the
-# panel<->manager pairing survives upgrades:
-#   - admin secret: reuse the one already in the panel .env (if present)
-#   - node secret : reuse the one already in the manager env file (if present)
-# Otherwise fresh random secrets are generated. Safe to call in both flows.
-sm_prepare_secrets() {
-  local existing_admin existing_node
-  # NOTE: `|| true` is required — under `set -Eeuo pipefail` a non-matching grep
-  # exits 1 and would abort the whole installer via the ERR trap. A missing key
-  # is normal (fresh install, or upgrade from a pre-Session-Manager version).
-  existing_admin="$(grep '^SESSION_MANAGER_ADMIN_SECRET=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d= -f2- || true)"
-  # XNET_SM_NODE_SECRETS is "id:secret"; strip the "id:" prefix to recover the secret.
-  existing_node="$(grep '^XNET_SM_NODE_SECRETS=' "$SM_ENV_FILE" 2>/dev/null | cut -d= -f2- | sed 's/^[^:]*://' || true)"
-  SM_ADMIN_SECRET="${existing_admin:-$(rand_hex 32)}"
-  SM_NODE_SECRET="${existing_node:-$(rand_hex 32)}"
-  # Register the local node under the panel's node id (falls back to node-local)
-  # so the manager's data-plane is ready and doesn't warn about missing secrets.
-  SM_NODE_ID="${NODE_ID:-node-local}"
+# ----- secret plumbing --------------------------------------------------------
+# One resolved secret has to land in several files, and a botched write to any of
+# them takes the panel or the manager down. These helpers are the only way this
+# installer edits a key in place, so the newline hazard and the "did it actually
+# change?" question are answered once rather than at every call site.
+
+# env_get_kv FILE KEY — echo KEY's value, or nothing. Never fails: a missing file
+# or key is normal on a fresh install and must not trip the ERR trap.
+env_get_kv() {
+  local file="$1" key="$2"
+  [ -f "$file" ] || return 0
+  grep "^${key}=" "$file" 2>/dev/null | head -n1 | cut -d= -f2- || true
 }
 
-# sm_ensure_panel_env wires the panel .env to the local manager by appending the
-# SESSION_MANAGER_* lines, but ONLY when (a) the manager binary is actually in
+# env_set_kv FILE KEY VALUE — set KEY=VALUE, replacing an existing line or
+# appending one. Sets ENV_KV_CHANGED=1 when the file was modified, 0 when the
+# value was already correct, so callers can report only real repairs.
+#
+# The status is returned through a global rather than an exit code on purpose:
+# under `set -Eeuo pipefail` a `return 1` for "nothing to do" would abort the
+# installer through the ERR trap at every unchanged key.
+ENV_KV_CHANGED=0
+env_set_kv() {
+  local file="$1" key="$2" val="$3" cur
+  ENV_KV_CHANGED=0
+  [ -f "$file" ] || return 0
+  if grep -q "^${key}=" "$file" 2>/dev/null; then
+    cur="$(env_get_kv "$file" "$key")"
+    [ "$cur" = "$val" ] && return 0
+    # `|` cannot appear in a hex secret, a node id, or the URLs written here.
+    sed -i "s|^${key}=.*|${key}=${val}|" "$file"
+    ENV_KV_CHANGED=1
+    return 0
+  fi
+  # A file with no trailing newline would splice the new key onto the last
+  # setting, destroying both. Close the line first.
+  if [ -s "$file" ] && [ "$(tail -c1 "$file" | wc -l)" -eq 0 ]; then
+    echo >> "$file"
+  fi
+  echo "${key}=${val}" >> "$file"
+  ENV_KV_CHANGED=1
+  return 0
+}
+
+# sm_db_get_node_secret NODEID — echo the node's stored sm_node_secret from the
+# panel database, or nothing.
+#
+# The database is the source of truth for this secret: the panel MINTS it there
+# (handlers.ensureSecret) whenever the column is empty and then writes that value
+# into sing-box's config, with no knowledge of any env file. An installer that
+# generated its own would be handing the manager a different secret from the one
+# the data plane actually presents — which is exactly the drift that refuses
+# every user on the node behind a misleading STORE_TIMEOUT.
+#
+# sqlite3 is NOT an installer dependency, so a missing binary or an unreadable
+# database degrades to the env chain rather than failing the install.
+sm_db_get_node_secret() {
+  local node_id="$1" db="${INSTALL_DIR}/data/xnet.db"
+  [ -n "$node_id" ] || return 0
+  [ -f "$db" ] || return 0
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+  # A running panel holds the write lock briefly; a read that waits beats a read
+  # that silently returns empty and re-randomises the secret.
+  sqlite3 -cmd ".timeout 5000" "$db" \
+    "SELECT COALESCE(sm_node_secret,'') FROM nodes WHERE id='${node_id}';" 2>/dev/null || true
+}
+
+# sm_db_set_node_secret NODEID SECRET — persist the resolved secret back into the
+# panel database so the source of truth carries it from here on. Best-effort: on
+# a fresh install the nodes row may not exist yet, and the panel mints and stores
+# its own on first boot, which the NEXT installer run then adopts.
+sm_db_set_node_secret() {
+  local node_id="$1" secret="$2" db="${INSTALL_DIR}/data/xnet.db"
+  [ -n "$node_id" ] && [ -n "$secret" ] || return 0
+  [ -f "$db" ] || return 0
+  command -v sqlite3 >/dev/null 2>&1 || return 0
+  sqlite3 -cmd ".timeout 5000" "$db" \
+    "UPDATE nodes SET sm_node_secret='${secret}' WHERE id='${node_id}' AND COALESCE(sm_node_secret,'') <> '${secret}';" \
+    >/dev/null 2>&1 || true
+}
+
+# sm_resolve_node_id picks the node id the manager keys this node's credential
+# on, preferring whatever the node is ALREADY known as so the id survives
+# upgrades:
+#   1. SESSION_ADMISSION_NODE_ID already in the panel .env (what the running
+#      sing-box config was generated from)
+#   2. NODE_ID in the panel .env (authoritative on upgrades — the in-memory
+#      NODE_ID is only populated by a fresh install's prompt)
+#   3. the in-memory NODE_ID (fresh install)
+#   4. "node-local"
+#
+# Step 2 is the one that matters on upgrade: without it every upgrade re-derived
+# "node-local" regardless of the id the panel actually uses, so a database lookup
+# keyed on the id could never match.
+sm_resolve_node_id() {
+  local v
+  v="$(env_get_kv "${INSTALL_DIR}/.env" SESSION_ADMISSION_NODE_ID)"
+  [ -n "$v" ] && { echo "$v"; return 0; }
+  v="$(env_get_kv "${INSTALL_DIR}/.env" NODE_ID)"
+  [ -n "$v" ] && { echo "$v"; return 0; }
+  echo "${NODE_ID:-node-local}"
+}
+
+# sm_prepare_secrets resolves the admin + node HMAC secrets used by BOTH the
+# manager service and the panel. Each secret has ONE source of truth, and this
+# function's job is to find it — never to invent a competing one:
+#
+#   - node secret : the panel DATABASE (nodes.sm_node_secret), falling back, in
+#     order, to the panel .env, then the manager env, then a fresh random value
+#     on a genuinely new install. The resolved value is written back to the
+#     database so later runs read it from the one authoritative place.
+#   - admin secret: the panel .env, falling back to the manager env, then fresh.
+#
+# Every sink is then repaired to match by sm_ensure_panel_env,
+# ensure_session_admission_env and install_session_manager. Resolve here, write
+# everywhere, so no run can leave two files disagreeing.
+sm_prepare_secrets() {
+  local from_db from_panel from_mgr
+  SM_NODE_ID="$(sm_resolve_node_id)"
+
+  # --- node secret: database first ---
+  from_db="$(sm_db_get_node_secret "$SM_NODE_ID")"
+  from_panel="$(env_get_kv "${INSTALL_DIR}/.env" SESSION_ADMISSION_NODE_SECRET)"
+  # XNET_SM_NODE_SECRETS is "id:secret"; strip the "id:" prefix to recover the secret.
+  from_mgr="$(env_get_kv "$SM_ENV_FILE" XNET_SM_NODE_SECRETS | sed 's/^[^:]*://')"
+  if [ -n "$from_db" ]; then
+    SM_NODE_SECRET="$from_db"
+  elif [ -n "$from_panel" ]; then
+    SM_NODE_SECRET="$from_panel"
+  elif [ -n "$from_mgr" ]; then
+    SM_NODE_SECRET="$from_mgr"
+  else
+    SM_NODE_SECRET="$(rand_hex 32)"
+  fi
+  # Seed the source of truth so the next run reads it from the database.
+  sm_db_set_node_secret "$SM_NODE_ID" "$SM_NODE_SECRET"
+
+  # --- admin secret: panel .env first ---
+  from_panel="$(env_get_kv "${INSTALL_DIR}/.env" SESSION_MANAGER_ADMIN_SECRET)"
+  from_mgr="$(env_get_kv "$SM_ENV_FILE" XNET_SM_ADMIN_SECRETS | sed 's/^[^:]*://')"
+  if [ -n "$from_panel" ]; then
+    SM_ADMIN_SECRET="$from_panel"
+  elif [ -n "$from_mgr" ]; then
+    SM_ADMIN_SECRET="$from_mgr"
+  else
+    SM_ADMIN_SECRET="$(rand_hex 32)"
+  fi
+}
+
+# sm_ensure_panel_env wires the panel .env to the local manager, and REPAIRS it
+# when it has drifted. It runs only when (a) the manager binary is actually in
 # the bundle (so we never mark the panel "configured" without a manager to talk
-# to) and (b) the lines are not already present. Idempotent; used by BOTH fresh
-# and upgrade flows (create_env writes the base .env without these lines).
+# to) and (b) this is a panel host. Idempotent; used by BOTH fresh and upgrade
+# flows (create_env writes the base .env without these lines).
+#
+# It used to return early whenever SESSION_MANAGER_URL was already present. That
+# made the panel .env write-once while install_session_manager rewrote the
+# manager env on EVERY run, so any run that failed to recover the old admin
+# secret left the two files permanently disagreeing — with no error anywhere,
+# because the panel's admin calls then fail as plain 401s that nothing surfaces.
+# Repairing each key against the resolved value makes that state unreachable.
 sm_ensure_panel_env() {
   # The admin API + local manager live on the PANEL host only; agents have no
   # local manager to point the admin client at.
   [ "$(effective_node_role)" = "panel" ] || return 0
   [ -f "$SCRIPT_DIR/xnet-session-manager" ] || return 0
   [ -f "${INSTALL_DIR}/.env" ] || return 0
-  if grep -q '^SESSION_MANAGER_URL=' "${INSTALL_DIR}/.env" 2>/dev/null; then
-    return 0
+
+  local had_url added=0 repaired=0 k
+  had_url="$(env_get_kv "${INSTALL_DIR}/.env" SESSION_MANAGER_URL)"
+
+  for k in "SESSION_MANAGER_URL=${SM_URL}" \
+           "SESSION_MANAGER_ACTOR_ID=${SM_ACTOR_ID}" \
+           "SESSION_MANAGER_ADMIN_SECRET=${SM_ADMIN_SECRET}"; do
+    env_set_kv "${INSTALL_DIR}/.env" "${k%%=*}" "${k#*=}"
+    if [ "$ENV_KV_CHANGED" = "1" ]; then
+      if [ -n "$had_url" ]; then repaired=1; else added=1; fi
+    fi
+  done
+
+  if [ "$repaired" = "1" ]; then
+    ok "Session Manager pairing in panel .env repaired (it had drifted from the manager)."
+  elif [ "$added" = "1" ]; then
+    ok "Session Manager wiring added to panel .env."
   fi
-  cat >> "${INSTALL_DIR}/.env" <<EOF
-SESSION_MANAGER_URL=${SM_URL}
-SESSION_MANAGER_ACTOR_ID=${SM_ACTOR_ID}
-SESSION_MANAGER_ADMIN_SECRET=${SM_ADMIN_SECRET}
-EOF
-  ok "Session Manager wiring added to panel .env."
 }
 
 # ensure_ssh_enforce_trace_env turns on the SSH enforcement trace.
@@ -2063,12 +2207,22 @@ ensure_session_admission_env() {
   # provided out-of-band (see the multi-node deploy notes) — if SESSION_ADMISSION_*
   # is pre-set in the agent's .env it is honored as-is and left untouched here.
   if [ "$(effective_node_role)" = "panel" ] && [ -f "$SCRIPT_DIR/xnet-session-manager" ] && [ -n "$SM_NODE_ID" ] && [ -n "$SM_NODE_SECRET" ]; then
-    if ! grep -q '^SESSION_ADMISSION_MANAGER_ENDPOINT=' "${INSTALL_DIR}/.env" 2>/dev/null; then
-      cat >> "${INSTALL_DIR}/.env" <<EOF
-SESSION_ADMISSION_MANAGER_ENDPOINT=${SM_GRPC_ENDPOINT}
-SESSION_ADMISSION_NODE_ID=${SM_NODE_ID}
-SESSION_ADMISSION_NODE_SECRET=${SM_NODE_SECRET}
-EOF
+    # These three keys are what the panel writes into sing-box's config, so a
+    # stale SESSION_ADMISSION_NODE_SECRET here is the value the data plane
+    # actually presents to the manager. Repairing it (rather than appending only
+    # when absent, as this did) is what keeps the node's credential equal to the
+    # one sm_prepare_secrets resolved from the database.
+    local sa_added=0 sa_repaired=0 sa_had
+    sa_had="$(env_get_kv "${INSTALL_DIR}/.env" SESSION_ADMISSION_MANAGER_ENDPOINT)"
+    env_set_kv "${INSTALL_DIR}/.env" SESSION_ADMISSION_MANAGER_ENDPOINT "$SM_GRPC_ENDPOINT"
+    [ "$ENV_KV_CHANGED" = "1" ] && { if [ -n "$sa_had" ]; then sa_repaired=1; else sa_added=1; fi; }
+    env_set_kv "${INSTALL_DIR}/.env" SESSION_ADMISSION_NODE_ID "$SM_NODE_ID"
+    [ "$ENV_KV_CHANGED" = "1" ] && { if [ -n "$sa_had" ]; then sa_repaired=1; else sa_added=1; fi; }
+    env_set_kv "${INSTALL_DIR}/.env" SESSION_ADMISSION_NODE_SECRET "$SM_NODE_SECRET"
+    [ "$ENV_KV_CHANGED" = "1" ] && { if [ -n "$sa_had" ]; then sa_repaired=1; else sa_added=1; fi; }
+    if [ "$sa_repaired" = "1" ]; then
+      ok "Node credential for the Session Manager repaired (it had drifted from the database)."
+    elif [ "$sa_added" = "1" ]; then
       ok "Node wired to central Session Manager (RemoteStore @ ${SM_GRPC_ENDPOINT}, node_id=${SM_NODE_ID})."
     fi
     # 2b) PUBLIC manager endpoint the panel PUSHES to remote agents during
