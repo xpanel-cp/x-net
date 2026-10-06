@@ -34,6 +34,34 @@
 #
 # Dropbear takes a single global -b file and has no per-user equivalent, so it
 # keeps the static text plus the /etc/profile.d hook for its stats block.
+#
+# LOCALIZATION (4 languages: en/fa/ru/zh — design note:
+# docs/ssh-banner-i18n-design-note.md):
+#
+# Each account carries its own `language` column. The effective language and
+# the welcome-banner TEMPLATE text are resolved separately and must stay that
+# way — resolve_language() never looks at template availability, so a missing
+# localized template does not change which language's stats labels are used
+# (LABELS below). resolve_language()/resolve_template() mirror
+# bannerResolveLanguage()/bannerResolveTemplate() in
+# backend/handlers/ssh_banner_i18n.go exactly (same 3-step / 4-step chains) —
+# that Go file is the canonical source for this precedence; keep both in sync
+# by hand, the same way greetScript/profileScript in ssh.go are kept in step
+# with this file already.
+#
+# SECURITY: the welcome-banner template is ADMINISTRATOR-controlled but
+# UNTRUSTED text (the design review treats it as such explicitly). Only 7
+# placeholders are substituted — {username}, {daysRemaining}, {trafficUsed},
+# {trafficLimit}, {maxLogin}, {trafficPercent}, {trafficBar} — via plain regex
+# replacement (render_placeholders below), never str.format()/eval()/any
+# shell. An unrecognized {word} is left completely literal. Nothing derived
+# from the template, from any of the 7 values, or from an account row is
+# ever passed to subprocess — every
+# subprocess call in this file takes a fixed argv list unrelated to banner
+# content (sshd -t, systemctl) and none of them use shell=True. The only sink
+# for banner content is write_atomic(), i.e. a plain file write.
+import json
+import math
 import os
 import re
 import sqlite3
@@ -41,6 +69,7 @@ import subprocess
 import sys
 import syslog
 import tempfile
+from datetime import datetime, timezone
 
 BANNER_TEXT_FILE = "/etc/ssh/xnet-banner.txt"
 BANNER_DIR = "/etc/ssh/xnet-banners"
@@ -65,6 +94,265 @@ DB_PATHS = [
     "/opt/xnet/xnet.db",
     "/var/lib/xnet/xnet.db",
 ]
+
+
+# ------------------------------------------------------------- localization --
+
+# Exactly the 4 locales this phase supports — mirrors bannerSupportedLangs in
+# backend/handlers/ssh_banner_i18n.go. Do not add a 5th language here without
+# adding it there too.
+SUPPORTED_LANGS = ("en", "fa", "ru", "zh")
+
+# Stats-block labels, keyed [field][lang]. Shares vocabulary with
+# handlers/subscription_i18n.go's subStrings (same words for "username" /
+# "unlimited" where the two features overlap) but is its OWN table — the
+# subscription page's wording and this compact, fixed-width terminal block's
+# wording are allowed to diverge without one edit silently affecting the
+# other. English is the fallback for any missing entry, exactly like subText.
+LABELS = {
+    "account": {"en": "Account", "fa": "نام کاربری", "ru": "Аккаунт", "zh": "账户"},
+    "expiry": {"en": "Expiry", "fa": "تاریخ انقضا", "ru": "Срок действия", "zh": "到期"},
+    "noExpiry": {"en": "No expiry", "fa": "بدون انقضا", "ru": "Без срока", "zh": "无期限"},
+    "used": {"en": "Used", "fa": "مصرف‌شده", "ru": "Использовано", "zh": "已用"},
+    "traffic": {"en": "Traffic", "fa": "ترافیک", "ru": "Трафик", "zh": "流量"},
+    "unlimited": {"en": "Unlimited", "fa": "نامحدود", "ru": "Безлимит", "zh": "无限制"},
+    "maxConn": {"en": "Max Conn", "fa": "اتصال همزمان", "ru": "Макс. подключений", "zh": "最大连接数"},
+}
+
+
+def label(key, lang):
+    """Localized label text for key in lang, falling back to English — mirrors
+    subText() in subscription_i18n.go."""
+    row = LABELS.get(key) or {}
+    return row.get(lang) or row.get("en") or key
+
+
+# Built-in welcome-banner text for a language with neither its own
+# BannerTemplates entry nor a legacy Banner to fall back to. Mirrors
+# bannerBuiltinDefaults in ssh_banner_i18n.go byte-for-byte; keep both in sync.
+BUILTIN_DEFAULTS = {
+    "en": "Welcome, {username}!",
+    "fa": "{username} خوش آمدید!",
+    "ru": "Добро пожаловать, {username}!",
+    "zh": "欢迎，{username}！",
+}
+
+# The ONLY 7 placeholders substituted in a welcome-banner template this phase.
+# Anything else matching {\w+} is left completely literal — see
+# render_placeholders().
+PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
+
+
+def resolve_language(account_lang, default_lang):
+    """The approved 3-step chain — mirrors bannerResolveLanguage() in
+    ssh_banner_i18n.go exactly, and ONLY this chain: it never looks at
+    templates. account_lang if valid -> default_lang if valid -> "en"."""
+    if account_lang in SUPPORTED_LANGS:
+        return account_lang
+    if default_lang in SUPPORTED_LANGS:
+        return default_lang
+    return "en"
+
+
+def resolve_template(lang, templates, legacy_banner):
+    """The approved 4-step chain — mirrors bannerResolveTemplate() in
+    ssh_banner_i18n.go exactly: templates[lang] if non-blank -> legacy_banner
+    if non-blank -> BUILTIN_DEFAULTS[lang] -> BUILTIN_DEFAULTS["en"].
+
+    This is what makes "an existing installation with only a legacy Banner
+    sees the exact same text after upgrading" hold: step 2 reproduces it for
+    every language, unconditionally, until an administrator edits the new
+    per-language templates themselves."""
+    if isinstance(templates, dict):
+        t = templates.get(lang)
+        if t and t.strip():
+            return t
+    if legacy_banner and legacy_banner.strip():
+        return legacy_banner
+    return BUILTIN_DEFAULTS.get(lang, BUILTIN_DEFAULTS["en"])
+
+
+def sanitize_template_text(s):
+    """Security policy for admin-authored template text, applied to the FINAL
+    assembled per-account banner content before it is written to disk.
+
+    - Null bytes are rejected unconditionally: they cannot legitimately occur
+      in an sshd banner file and some C string handling (including sshd's own
+      config/banner parsing) treats '\\0' as a terminator, which could make
+      trailing content silently vanish. Stripped, not escaped.
+    - Normal newlines are kept — the admin's banner text has always been
+      multi-line (a <textarea>) and must keep working exactly as before.
+    - No other control character (including raw ANSI escape sequences) is
+      stripped. This is a deliberate, documented choice, not an oversight:
+      the existing banner mechanism has always been plain text written
+      verbatim to a file (write_atomic — see its docstring) and NEVER passed
+      to a shell, eval, or any other execution sink anywhere in this script
+      or in applySSHBannerInProcess (ssh.go). An admin who deliberately
+      includes ANSI color codes for terminal formatting — a pre-existing
+      capability of this exact banner mechanism — keeps that working. There
+      is no execution boundary downstream of this file for a control
+      character to escape, so stripping them would only remove a legitimate
+      formatting feature without closing any actual attack surface."""
+    return s.replace("\x00", "")
+
+
+def render_placeholders(template, values):
+    """Deterministic, non-executable substitution of the 5 approved
+    placeholders. Regex-based — NEVER str.format()/eval()/%-formatting on
+    admin-controlled text: str.format() in particular would let a crafted
+    template reach attribute/index access (e.g. "{0.__class__}"), which is
+    unnecessary risk for zero benefit here. An unrecognized {word} (a typo, or
+    a placeholder this phase does not implement, e.g. {expiryDate}) is left
+    byte-for-byte as typed, including its braces — never an error, never
+    silently dropped."""
+
+    def sub(m):
+        key = m.group(1)
+        if key in values:
+            return str(values[key])
+        return m.group(0)
+
+    return PLACEHOLDER_RE.sub(sub, template)
+
+
+def parse_expire_date(s):
+    """Mirrors parseSSHExpireDate() in handlers/ssh.go: tolerant of RFC3339,
+    "YYYY-MM-DDTHH:MM:SS", "YYYY-MM-DD HH:MM:SS", "YYYY-MM-DD", "YYYY/MM/DD",
+    and a leading-10-characters fallback, in that order. A blank or
+    unparseable value returns None ("no expiry"), exactly like Go's zero
+    time.Time. Always returns a timezone-AWARE UTC datetime (never naive
+    local time) so the comparison in compute_days_remaining matches the
+    panel's own time.Now().UTC() / the frontend's Date.now() semantics
+    regardless of this host's system timezone."""
+    if not s:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        iso = s[:-1] + "+00:00" if s.endswith("Z") else s
+        dt = datetime.fromisoformat(iso)
+        return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        pass
+    for layout in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, layout).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    if len(s) >= 10:
+        try:
+            return datetime.strptime(s[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
+    return None
+
+
+def compute_days_remaining(expire_date_str, duration_days, now=None):
+    """{daysRemaining}'s value — REUSES the panel's existing expiry semantics,
+    not an independent interpretation (design requirement):
+
+    - A parseable expire_date in the past means the account is expired
+      (same rule as sshAccountBlocked in handlers/ssh.go:
+      parseSSHExpireDate + time.Now().After(exp)) — returns 0, never
+      negative, matching the clamp the Expired badge in
+      src/pages/SSHServices.tsx already applies instead of a negative count.
+    - A parseable expire_date in the future: ceil((expire - now) / 86400)
+      days — the exact formula the account-list row already uses
+      (Math.ceil((exp - Date.now()) / (1000*3600*24))), just computed from
+      two UTC-aware datetimes here instead of two JS epoch-ms values; both
+      are timezone-independent at the math level.
+    - No expire_date but duration_days > 0: a PENDING "starts on first
+      connection" account (Reconciler.activateSSHExpiry / the
+      ssh_single_first_connection_test.go contract) — the window has not
+      started, so this returns the CONFIGURED duration itself, exactly what
+      the account-list row shows in that case ("{duration_days} days —
+      Starts on first connection"), not a countdown.
+    - Neither set: unlimited. Returns None; the caller substitutes the
+      localized "Unlimited" word, the same convention format_percent() and
+      the max-login field already use for "no limit".
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
+    exp = parse_expire_date(expire_date_str)
+    if exp is not None:
+        delta = exp - now
+        return max(math.ceil(delta.total_seconds() / 86400.0), 0)
+    try:
+        dd = int(duration_days or 0)
+    except (TypeError, ValueError):
+        dd = 0
+    if dd > 0:
+        return dd
+    return None
+
+
+def placeholder_values(username, expire_date, traffic_limit, traffic_used, max_login, duration_days, lang):
+    """Builds the dict render_placeholders() substitutes from — the single
+    place that decides what each of the 7 approved placeholders means, reusing
+    the SAME pure helpers (usage_ratio/human_bytes/format_percent/make_bar)
+    format_block() uses for the stats block, so the two never disagree about
+    what "used"/"unlimited"/a given percentage mean for the same account."""
+    days = compute_days_remaining(expire_date, duration_days)
+    days_str = label("unlimited", lang) if days is None else str(days)
+
+    ratio = usage_ratio(traffic_used, traffic_limit)
+    used_str = human_bytes(traffic_used or 0)
+    limit_str = label("unlimited", lang) if ratio is None else human_bytes(traffic_limit)
+    # format_percent(None) returns a hardcoded, non-localized "Unlimited" (it
+    # is never reached via format_block, which branches around it instead —
+    # see format_block's own ratio-is-None branch) — so None is handled here
+    # the exact same way as every other field above, via label(), rather than
+    # by calling format_percent/make_bar with a ratio they do not expect.
+    if ratio is None:
+        percent_str = label("unlimited", lang)
+        bar_str = label("unlimited", lang)
+    else:
+        percent_str = format_percent(ratio)
+        bar_str = make_bar(ratio)
+
+    max_login_str = str(int(max_login)) if max_login else label("unlimited", lang)
+
+    return {
+        "username": username or "",
+        "daysRemaining": days_str,
+        "trafficUsed": used_str,
+        "trafficLimit": limit_str,
+        "maxLogin": max_login_str,
+        "trafficPercent": percent_str,
+        "trafficBar": bar_str,
+    }
+
+
+def load_banner_settings(db_path):
+    """Reads ssh_settings.settings_json (the SAME JSON blob the panel's own
+    GET/PUT /api/ssh/settings read and write — no new table, no new file) and
+    returns (templates, legacy_banner, default_lang).
+
+    Tolerant of a missing row, NULL/empty JSON, or a malformed blob: any
+    failure here returns all-empty values, which makes every account resolve
+    through to the built-in defaults rather than crash either banner-writing
+    mode. A corrupt settings row must never be able to take down every
+    account's SSH banner."""
+    try:
+        conn = sqlite3.connect(db_path, timeout=3)
+        try:
+            row = conn.execute("SELECT settings_json FROM ssh_settings WHERE id = 1").fetchone()
+        finally:
+            conn.close()
+        if not row or not row[0]:
+            return {}, "", ""
+        data = json.loads(row[0])
+        openssh = data.get("openssh") or {}
+        templates = openssh.get("bannerTemplates")
+        if not isinstance(templates, dict):
+            templates = {}
+        legacy = openssh.get("banner") or ""
+        default_lang = openssh.get("defaultBannerLang") or ""
+        return templates, legacy, default_lang
+    except Exception as exc:
+        diag("could not load banner settings from %s: %s" % (db_path, exc))
+        return {}, "", ""
 
 
 def diag(msg):
@@ -156,40 +444,52 @@ def format_percent(ratio):
     return "0%"
 
 
-def format_block(username, expire_date, traffic_limit, traffic_used, max_login):
-    """Render the stats block. Single source of truth for both modes."""
-    expiry_str = str(expire_date)[:10] if expire_date else "No expiry"
+def make_bar(ratio, bar_len=30):
+    """Renders a fixed-width ASCII progress bar for a 0-100 usage ratio.
+    Factored out of format_block so placeholder_values' {trafficBar} draws
+    the EXACT same bar, never a second implementation that could drift."""
+    filled = int(bar_len * ratio / 100)
+    return "#" * filled + "-" * (bar_len - filled)
+
+
+def format_block(username, expire_date, traffic_limit, traffic_used, max_login, lang):
+    """Render the stats block. Single source of truth for both modes.
+
+    Preserves exactly the same 5 fields and the same formatting semantics
+    (human_bytes/usage_ratio/format_percent, the progress bar, the separator
+    lines) as before localization — only the LABEL TEXT is now looked up via
+    label(key, lang) instead of hardcoded English. lang is the already-
+    resolved effective language (resolve_language() output); this function
+    does no resolution of its own."""
+    expiry_str = str(expire_date)[:10] if expire_date else label("noExpiry", lang)
     ratio = usage_ratio(traffic_used, traffic_limit)
-    limit_str = "Unlimited" if ratio is None else human_bytes(traffic_limit)
+    limit_str = label("unlimited", lang) if ratio is None else human_bytes(traffic_limit)
     used_str = human_bytes(traffic_used or 0)
 
-    bar_len = 30
     if ratio is None:
         # A progress bar against an unlimited quota is meaningless, and drawing
         # an empty one next to "0%" is what makes an unlimited account look like
         # a broken one.
-        traffic_line = "  Traffic   : Unlimited"
+        traffic_line = f"  {label('traffic', lang):10}: {label('unlimited', lang)}"
     else:
-        filled = int(bar_len * ratio / 100)
-        bar = "#" * filled + "-" * (bar_len - filled)
-        traffic_line = f"  Traffic   : [{bar}] {format_percent(ratio)}"
+        traffic_line = f"  {label('traffic', lang):10}: [{make_bar(ratio)}] {format_percent(ratio)}"
 
-    max_conn_str = str(int(max_login)) if max_login else "Unlimited"
+    max_conn_str = str(int(max_login)) if max_login else label("unlimited", lang)
     sep = "-" * 50
     return "\n".join(
         [
             sep,
-            f"  Account   : {username}",
-            f"  Expiry    : {expiry_str}",
-            f"  Used      : {used_str} / {limit_str}",
+            f"  {label('account', lang):10}: {username}",
+            f"  {label('expiry', lang):10}: {expiry_str}",
+            f"  {label('used', lang):10}: {used_str} / {limit_str}",
             traffic_line,
-            f"  Max Conn  : {max_conn_str}",
+            f"  {label('maxConn', lang):10}: {max_conn_str}",
             sep,
         ]
     )
 
 
-COLUMNS = "username, expire_date, traffic_limit_bytes, traffic_used_bytes, max_login"
+COLUMNS = "username, expire_date, traffic_limit_bytes, traffic_used_bytes, max_login, duration_days, language"
 
 
 def fetch_all(db_path):
@@ -244,7 +544,10 @@ def cmd_print(username, out):
     # Not a panel account (root, the admin's own login, a system user) — stay quiet.
     if not row:
         return 0
-    print(format_block(*row), file=out)
+    username, expire_date, traffic_limit, traffic_used, max_login, duration_days, raw_lang = row
+    _, _, default_lang = load_banner_settings(db_path)
+    lang = resolve_language(raw_lang or "", default_lang)
+    print(format_block(username, expire_date, traffic_limit, traffic_used, max_login, lang), file=out)
     try:
         out.flush()
     except Exception:
@@ -263,20 +566,39 @@ def read_banner_text():
         return ""
 
 
-def sync_banner_files(banner_text, rows):
+def sync_banner_files(templates, legacy_banner, default_lang, rows):
     """Write one banner file per account; drop files for accounts that are gone.
-    Returns the sorted list of usernames that now have a file."""
+    Returns the sorted list of usernames that now have a file.
+
+    Each account's effective language and welcome-banner template are resolved
+    INDEPENDENTLY here (resolve_language then resolve_template — never the
+    reverse, and a missing template never changes the resolved language), so
+    two accounts with the same language but different per-account data render
+    different {username}/{daysRemaining}/etc. values against what may be the
+    very same template text."""
     os.makedirs(BANNER_DIR, exist_ok=True)
     os.chmod(BANNER_DIR, 0o755)
 
     wanted = {}
     for row in rows:
-        username = row[0]
+        username, expire_date, traffic_limit, traffic_used, max_login, duration_days, raw_lang = row
         if not username or not SAFE_USERNAME.match(username):
             if username:
                 diag("skipping account with unsupported username: %r" % username)
             continue
-        wanted[username] = banner_text + "\n" + format_block(*row) + "\n"
+        lang = resolve_language(raw_lang or "", default_lang)
+        welcome_template = resolve_template(lang, templates, legacy_banner)
+        values = placeholder_values(username, expire_date, traffic_limit, traffic_used, max_login, duration_days, lang)
+        welcome_text = render_placeholders(welcome_template, values)
+        # The fixed-format stats block (format_block) used to be appended
+        # after the welcome text unconditionally, duplicating whatever of
+        # {daysRemaining}/{trafficUsed}/{trafficLimit}/{maxLogin}/
+        # {trafficPercent}/{trafficBar} the admin's own template already
+        # includes. The template is now the ONLY thing written — an admin who
+        # wants the old fixed layout can still reproduce it verbatim with
+        # those placeholders; one who does not is no longer shown it anyway.
+        content = welcome_text + "\n"
+        wanted[username] = sanitize_template_text(content)
 
     for username, content in wanted.items():
         path = os.path.join(BANNER_DIR, username + ".txt")
@@ -520,6 +842,10 @@ def remove_all():
 
 
 def cmd_write_banners():
+    # The flat file is still the single on/off switch for the whole feature —
+    # Go writes it from the resolved default-language template (see
+    # applySSHBannerInProcess, ssh.go), so "is anything configured at all"
+    # continues to mean exactly what it meant before localization existed.
     banner_text = read_banner_text()
     if not banner_text:
         remove_all()
@@ -536,7 +862,8 @@ def cmd_write_banners():
         diag("could not list accounts on %s: %s" % (db_path, exc))
         return 0
 
-    usernames = sync_banner_files(banner_text, rows)
+    templates, legacy_banner, default_lang = load_banner_settings(db_path)
+    usernames = sync_banner_files(templates, legacy_banner, default_lang, rows)
     changed, applied, skipped = sync_sshd_configs(usernames)
     if changed:
         reload_sshd()
