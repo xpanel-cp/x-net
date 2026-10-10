@@ -31,8 +31,22 @@ jget() {
   local path="$1" def="${2:-}"
   local val=""
   if [ "$have_jq" = "1" ]; then
-    val="$(jq -r "$path // empty" "$SETTINGS_FILE" 2>/dev/null)"
+    # Resolve the path to a variable and test it against null specifically —
+    # NOT jq's `// ` operator, which treats `false` the same as "absent" and
+    # fires its right-hand side for both. That silently replaced an explicit
+    # `"enabled": false` with this function's hardcoded default (`true` for
+    # openssh.enabled), which is what re-enabled OpenSSH on every apply even
+    # though the admin had turned it off and the DB still correctly stored
+    # `false` — the panel UI never showed the regression since nothing in
+    # this script writes back to the DB, so only the live service state was
+    # wrong. A missing key also resolves to null in jq, so this still falls
+    # through to `def` exactly like before for every other field.
+    val="$(jq -r "($path) as \$v | if \$v == null then empty else \$v end" "$SETTINGS_FILE" 2>/dev/null)"
   else
+    # Lowercased to match jq's raw boolean output ("true"/"false") and the
+    # `[ "$enabled" = "true" ]` comparisons every caller makes — Python's own
+    # str(bool) is "True"/"False" (capitalized), which would silently read
+    # every enabled subsystem as disabled on a jq-less host.
     val="$(python3 - "$SETTINGS_FILE" "$path" <<'PY' 2>/dev/null
 import json,sys
 data=json.load(open(sys.argv[1]))
@@ -44,7 +58,12 @@ for k in path:
     else:
         cur=""
         break
-print("" if cur is None else cur)
+if cur is None:
+    print("")
+elif isinstance(cur,bool):
+    print("true" if cur else "false")
+else:
+    print(cur)
 PY
 )"
   fi
