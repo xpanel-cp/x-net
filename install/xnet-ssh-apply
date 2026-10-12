@@ -328,19 +328,25 @@ XNET_FC_SCRIPT="/opt/xnet/xnet-fc"
 XNET_FC_PAM_SCRIPT="/opt/xnet/xnet-fc-pam"
 
 apply_ssh_banner() {
-  local banner_text
-  banner_text="$(jget '.openssh.banner' '')"
+  local banner_enabled banner_text default_lang lang
+
+  # The explicit on/off switch (SSHOpenSSHSettings.BannerEnabled). Mirrors
+  # bannerIsConfigured in ssh_banner_i18n.go — NOT inferred from whether any
+  # banner text happens to be blank. This script used to key off
+  # `.openssh.banner` alone (the single legacy field), which the panel UI no
+  # longer writes from its per-language template editor: every save through
+  # the panel therefore reached this function with an empty legacy field,
+  # even with bannerEnabled=true and real text sitting in bannerTemplates,
+  # and took the disabled branch below — wiping out a banner the admin had
+  # just turned on (and re-wiping one restored by hand, on the next save).
+  banner_enabled="$(jget '.openssh.bannerEnabled' 'false')"
 
   # Retire the session-hook mechanisms on every run, banner on or off, so an
   # upgraded server cannot end up printing the block twice (or running a hook
   # that never worked).
   remove_legacy_hooks
 
-  # Trim leading/trailing blank lines so an accidental Enter before the first
-  # word does not push the message down.
-  banner_text="$(printf '%s' "$banner_text" | awk 'NF{found=1} found{print}' | awk '{lines[NR]=$0} END{for(i=NR;i>=1;i--){if(lines[i]~/[^[:space:]]/){last=i;break}} for(i=1;i<=last;i++){print lines[i]}}')"
-
-  if [ -z "$banner_text" ] || [ "$banner_text" = "null" ]; then
+  if [ "$banner_enabled" != "true" ]; then
     rm -f "$XNET_BANNER_FILE" 2>/dev/null || true
     local cfg
     for cfg in /etc/ssh/sshd_config /etc/ssh/sshd_config_ws /etc/ssh/sshd_config_tls /etc/ssh/sshd_config_dns; do
@@ -352,9 +358,35 @@ apply_ssh_banner() {
     regenerate_account_banners
     rm -f "$XNET_PROFILE_SCRIPT" "$XNET_SUDOERS_FILE" 2>/dev/null || true
     remove_refresh_timer
-    log "Banner: disabled — text, per-account banners, hooks and sudoers rule removed"
+    log "Banner: disabled (bannerEnabled=false) — text, per-account banners, hooks and sudoers rule removed"
     return 0
   fi
+
+  # WHAT text to write — mirrors bannerResolveGlobalText in ssh_banner_i18n.go
+  # byte-for-byte (keep both in sync): the default-language template, else the
+  # legacy single Banner field, else a built-in default for that language,
+  # else the English built-in. No placeholder substitution here on purpose —
+  # there is no specific account for the global file, so {username}/etc. have
+  # nothing to become.
+  default_lang="$(jget '.openssh.defaultBannerLang' 'en')"
+  case "$default_lang" in
+    en|fa|ru|zh) lang="$default_lang" ;;
+    *) lang="en" ;;
+  esac
+  banner_text="$(jget ".openssh.bannerTemplates.${lang}" '')"
+  [ -n "$banner_text" ] || banner_text="$(jget '.openssh.banner' '')"
+  if [ -z "$banner_text" ]; then
+    case "$lang" in
+      fa) banner_text='{username} خوش آمدید!' ;;
+      ru) banner_text='Добро пожаловать, {username}!' ;;
+      zh) banner_text='欢迎，{username}！' ;;
+      *)  banner_text='Welcome, {username}!' ;;
+    esac
+  fi
+
+  # Trim leading/trailing blank lines so an accidental Enter before the first
+  # word does not push the message down.
+  banner_text="$(printf '%s' "$banner_text" | awk 'NF{found=1} found{print}' | awk '{lines[NR]=$0} END{for(i=NR;i>=1;i--){if(lines[i]~/[^[:space:]]/){last=i;break}} for(i=1;i<=last;i++){print lines[i]}}')"
 
   printf '%s\n' "$banner_text" > "$XNET_BANNER_FILE"
   chmod 644 "$XNET_BANNER_FILE"
