@@ -13,6 +13,7 @@
 #
 #  Exit codes: 0 = success, 1 = usage/input error, 2 = partial apply error
 # ============================================================
+# XNET_SSH_APPLY_VERSION=10  (v10: kill the previous stunnel4 process explicitly before restarting it — its sysv init script does not reliably release the port itself, so every apply after the first failed with "Address already in use" and silently kept serving the STALE cert/port config instead of the one just written)
 # XNET_SSH_APPLY_VERSION=9   (v9: the per-account stats block moves into the SSH banner itself — per-account banner files selected by `Match User`, because session-channel output never reaches SSH-tunnel clients)
 # XNET_SSH_APPLY_VERSION=8   (v8: apply the panel's banner setting — write /etc/ssh/xnet-banner.txt + set Banner directive in all sshd configs + Dropbear -b flag; also install per-user info profile.d script)
 set -uo pipefail
@@ -887,6 +888,25 @@ cert = ${cert}
 key = ${key}
 CONF
   [ -f /etc/default/stunnel4 ] && sed -i 's/^ENABLED=.*/ENABLED=1/' /etc/default/stunnel4 2>/dev/null || true
+
+  # stunnel4's sysv init script does not reliably kill the PREVIOUS instance
+  # before (re)starting a new one: `systemctl restart stunnel4` on a live
+  # host failed every time with "Binding service [ssh-tls-direct] to
+  # 0.0.0.0:443: Address already in use" — the OLD process, running
+  # whatever cert/port config it was LAST started with, never released the
+  # port, so the config this apply just wrote (new cert path, new ports)
+  # never actually took over; stunnel4 just silently kept serving the stale
+  # one while every subsequent apply reported the same "failed to start"
+  # warning. stunnel4's own log even names the cause ("You should check
+  # that you have specified the pid= in your configuration file" — a known
+  # limitation of its init script, not of this config). Kill the previous
+  # process explicitly, by its pid file first and a pkill fallback for a
+  # stale/wrong pid file, before asking systemd to start a fresh one.
+  if [ -f /var/run/stunnel4.pid ]; then
+    kill "$(cat /var/run/stunnel4.pid 2>/dev/null)" >/dev/null 2>&1 || true
+  fi
+  pkill -f '/usr/bin/stunnel4' >/dev/null 2>&1 || true
+  sleep 1
   restart_unit stunnel4
   log "TLS/stunnel: direct_port=${port}->sshd_tls:${sshd_tls_port}, ws_tls_port=${ws_tls_port}->ws_proxy:${ws_proxy_port}"
 }
